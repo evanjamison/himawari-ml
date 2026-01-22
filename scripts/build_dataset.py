@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
+import re
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
-from PIL import Image, UnidentifiedImageError, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -15,6 +17,7 @@ DATA_SAMPLE_RAW = REPO_ROOT / "data" / "sample" / "raw"
 DATA_DERIVED = REPO_ROOT / "data" / "derived"
 
 # Now that we extract real features, require them by default.
+# NOTE: We do NOT require Himawari parsing columns here (to avoid breaking on non-matching filenames).
 DEFAULT_REQUIRED_COLS = [
     "relpath",
     "filename",
@@ -29,6 +32,56 @@ DEFAULT_REQUIRED_COLS = [
     "mean_luma",
     "std_luma",
 ]
+
+# Matches filenames like:
+#   himawari_D531106_4d_20260122_051000Z.png
+HIMAWARI_RE = re.compile(
+    r"himawari_(?P<product>[A-Za-z0-9]+)_(?P<res>[A-Za-z0-9]+)_(?P<date>\d{8})_(?P<time>\d{6})Z",
+    re.IGNORECASE,
+)
+
+
+def parse_himawari_filename(name: str) -> dict:
+    """
+    Extract metadata from filenames like:
+      himawari_D531106_4d_20260122_051000Z.png
+
+    Returns NA fields + parsed_ok=0 if pattern doesn't match.
+    """
+    out = {
+        "product_code": pd.NA,
+        "resolution_token": pd.NA,
+        "timestamp_utc": pd.NA,  # ISO string in UTC
+        "date_utc": pd.NA,  # YYYYMMDD
+        "time_utc": pd.NA,  # HHMMSS
+        "parsed_ok": 0,
+    }
+
+    m = HIMAWARI_RE.search(name)
+    if not m:
+        return out
+
+    product = m.group("product")
+    res = m.group("res")
+    d = m.group("date")
+    t = m.group("time")
+
+    try:
+        dt = datetime.strptime(d + t, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        return out
+
+    out.update(
+        {
+            "product_code": product,
+            "resolution_token": res,
+            "timestamp_utc": dt.isoformat(),
+            "date_utc": d,
+            "time_utc": t,
+            "parsed_ok": 1,
+        }
+    )
+    return out
 
 
 def find_images(raw_dir: Path) -> list[Path]:
@@ -64,9 +117,8 @@ def _safe_image_features(path: Path) -> dict:
             feat["height"] = int(h)
             feat["aspect_ratio"] = float(w) / float(h) if h else pd.NA
 
-            # RGB means
+            # RGB means (ImageStat avoids adding numpy dependency)
             rgb = im.convert("RGB")
-            # ImageStat is fast and avoids numpy dependency
             from PIL import ImageStat
 
             stat_rgb = ImageStat.Stat(rgb)
@@ -75,7 +127,7 @@ def _safe_image_features(path: Path) -> dict:
             feat["mean_g"] = float(g_mean)
             feat["mean_b"] = float(b_mean)
 
-            # Luma (grayscale) mean/std (simple brightness/contrast)
+            # Luma mean/std (brightness/contrast)
             gray = rgb.convert("L")
             stat_l = ImageStat.Stat(gray)
             feat["mean_luma"] = float(stat_l.mean[0])
@@ -98,13 +150,19 @@ def build_dataframe(image_paths: list[Path]) -> pd.DataFrame:
             "suffix": p.suffix.lower(),
             "bytes": p.stat().st_size,
         }
+
+        # NEW: filename-derived metadata (safe for non-matching files)
+        base.update(parse_himawari_filename(p.name))
+
+        # Image-derived features
         base.update(_safe_image_features(p))
+
         rows.append(base)
 
     df = pd.DataFrame(rows)
 
     # Use nullable numeric dtypes where possible (nice for missing values)
-    for col in ["width", "height", "img_ok"]:
+    for col in ["width", "height", "img_ok", "parsed_ok"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
 
@@ -219,13 +277,16 @@ def main() -> int:
 
     df.to_csv(out_path, index=False)
 
+    # Helpful counts for sanity checks
+    num_readable = int(pd.to_numeric(df.get("img_ok", 0), errors="coerce").fillna(0).sum()) if len(df) else 0
+    num_parsed = int(pd.to_numeric(df.get("parsed_ok", 0), errors="coerce").fillna(0).sum()) if len(df) else 0
+
     summary = {
         "mode": mode,
         "raw_dir": str(raw_dir),
         "num_files": len(images),
-        "num_readable_images": int(pd.to_numeric(df.get("img_ok", 0), errors="coerce").fillna(0).sum())
-        if len(df) > 0
-        else 0,
+        "num_readable_images": num_readable,
+        "num_parsed_filenames": num_parsed,
         "columns": list(df.columns),
         "output": str(out_path),
     }
