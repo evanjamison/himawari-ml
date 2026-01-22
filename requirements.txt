@@ -15,3 +15,5 @@ matplotlib>=3.9
 
 # Quality
 tqdm>=4.66
+
+ruff>=0.6
