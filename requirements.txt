@@ -17,3 +17,6 @@ matplotlib>=3.9
 tqdm>=4.66
 
 ruff>=0.6
+wh
+
+joblib>=1.4
