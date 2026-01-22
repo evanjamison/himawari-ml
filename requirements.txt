@@ -1,0 +1,17 @@
+# Core
+numpy>=1.26
+pandas>=2.2
+python-dotenv>=1.0
+requests>=2.32
+Pillow>=10.3
+
+# ML / DS
+scikit-learn>=1.5
+torch>=2.3
+torchvision>=0.18
+
+# Viz
+matplotlib>=3.9
+
+# Quality
+tqdm>=4.66

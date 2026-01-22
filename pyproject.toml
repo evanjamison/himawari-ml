@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "himawari-ml"
+version = "0.1.0"
+description = "Automated ML pipeline for Himawari satellite imagery (CV + PCA + MLOps)."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name="Your Name"}]
+license = {file="LICENSE"}
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]

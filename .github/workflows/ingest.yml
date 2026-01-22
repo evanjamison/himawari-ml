@@ -1,0 +1,39 @@
+name: ingest-latest
+
+on:
+  schedule:
+    - cron: "0 * * * *" # hourly
+  workflow_dispatch:
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ingest + Build dataset + Report
+        env:
+          HIMAWARI_SAMPLE_URL: ${{ secrets.HIMAWARI_SAMPLE_URL }}
+          IMAGE_SIZE: "512"
+          SEED: "42"
+        run: |
+          python -m himawari_ml.ingest.fetch_latest
+          python -m himawari_ml.preprocess.build_dataset
+          python -m himawari_ml.evaluation.visualize_predictions
+
+      - name: Commit outputs (optional)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: ingest + update artifacts" || echo "No changes to commit"
+          git push || echo "No push (forks/permissions)"
