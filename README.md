@@ -1,3 +1,6 @@
+![CI](https://github.com/evanjamison/himawari-ml/actions/workflows/ci.yml/badge.svg)
+
+
 # Himawari ML (Satellite CV + PCA + MLOps)
 
 Automated machine-learning pipeline that ingests Japanese geostationary satellite imagery (Himawari), preprocesses frames, trains models (segmentation / nowcasting / autoencoding), and publishes continuously updated results.
