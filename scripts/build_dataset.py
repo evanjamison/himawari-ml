@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-import sys
 import json
+from pathlib import Path
 
 import pandas as pd
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_RAW = REPO_ROOT / "data" / "raw"
@@ -36,13 +34,31 @@ def build_dataframe(image_paths: list[Path]) -> pd.DataFrame:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--raw-dir", default=str(DATA_RAW), help="Input directory (default: data/raw)")
-    ap.add_argument("--out", default=str(DATA_DERIVED / "samples.parquet"), help="Output dataset path")
-    ap.add_argument("--limit", type=int, default=0, help="If >0, only include first N files")
+    ap.add_argument(
+        "--raw-dir",
+        default=str(DATA_RAW),
+        help="Input directory (default: data/raw)",
+    )
+    ap.add_argument(
+        "--out",
+        default=str(DATA_DERIVED / "samples.csv"),
+        help="Output dataset path (CSV only)",
+    )
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="If >0, only include first N files",
+    )
     args = ap.parse_args()
 
     raw_dir = Path(args.raw_dir).resolve()
     out_path = Path(args.out).resolve()
+
+    # Enforce CSV-only to avoid parquet dependencies
+    if out_path.suffix.lower() != ".csv":
+        out_path = out_path.with_suffix(".csv")
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     images = find_images(raw_dir)
@@ -51,26 +67,14 @@ def main() -> int:
 
     df = build_dataframe(images)
 
-    # Write parquet if possible; otherwise fallback to CSV
-    wrote = None
-    if out_path.suffix.lower() == ".parquet":
-        try:
-            df.to_parquet(out_path, index=False)
-            wrote = str(out_path)
-        except Exception as e:
-            # fallback
-            csv_path = out_path.with_suffix(".csv")
-            df.to_csv(csv_path, index=False)
-            wrote = f"{csv_path} (parquet failed: {type(e).__name__})"
-    else:
-        df.to_csv(out_path, index=False)
-        wrote = str(out_path)
+    # CSV-only output
+    df.to_csv(out_path, index=False)
 
     summary = {
         "raw_dir": str(raw_dir),
         "num_files": len(images),
         "columns": list(df.columns),
-        "output": wrote,
+        "output": str(out_path),
     }
     print(json.dumps(summary, indent=2))
     return 0
@@ -78,3 +82,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
