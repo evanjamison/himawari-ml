@@ -3,7 +3,6 @@ name: ingest-latest
 on:
   workflow_dispatch:
   schedule:
-    # every 30 minutes (UTC). You can tighten to */10 once stable.
     - cron: "*/30 * * * *"
 
 permissions:
@@ -27,12 +26,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install system CA certificates
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ca-certificates
-          sudo update-ca-certificates
-
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
@@ -48,6 +41,8 @@ jobs:
       - name: Ingest (catch up) + Build dataset + Report
         env:
           PYTHONPATH: src
+          # 🔥 Unblock GH Actions SSL chain issue
+          ALLOW_INSECURE_SSL: "1"
         run: |
           python -m himawari_ml.ingest.fetch_latest --lookback-hours 72 --max-frames 192
           python -m himawari_ml.preprocess.build_dataset
@@ -58,10 +53,7 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
 
-          # Bring remote changes in, avoid push conflicts
           git pull --rebase || true
-
-          # Stage only the folders you intend to version
           git add data out || true
 
           if git diff --cached --quiet; then
