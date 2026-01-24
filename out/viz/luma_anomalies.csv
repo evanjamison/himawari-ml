@@ -1,0 +1,2 @@
+timestamp_utc,filename,relpath,mean_luma,is_anomaly
+2026-01-23 02:40:00+00:00,himawari_D531106_4d_20260123_024000Z.png,data/raw/sequence/himawari_D531106_4d_20260123_024000Z.png,0.5522347107438017,True
