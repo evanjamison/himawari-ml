@@ -3,15 +3,11 @@ name: ingest-latest
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */3 * * *"
-
-permissions:
-  contents: write
+    - cron: "*/30 * * * *"
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -20,22 +16,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install -e .
 
-      - name: Ingest via S3 mirror
+      - name: Ingest via NICT CDN
         env:
-          PYTHONPATH: src
+          GITHUB_ACTIONS: "true"
         run: |
-          python -m himawari_ml.ingest.fetch_latest --lookback-hours 72 --max-frames 192
+          python -m himawari_ml.ingest.fetch_latest
 
-      - name: Commit data
+      - name: Commit + push outputs
         run: |
-          git config user.name github-actions
-          git config user.email github-actions@users.noreply.github.com
-          git add data || true
-          git diff --cached --quiet && exit 0
-          git commit -m "auto(ingest): new Himawari frames"
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add data/raw || true
+          git commit -m "data: ingest latest Himawari frames" || echo "Nothing to commit"
           git push
