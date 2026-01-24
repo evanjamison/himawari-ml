@@ -1,4 +1,5 @@
 # src/himawari_ml/ingest/fetch_latest.py
+from __future__ import annotations
 # MUST be first — before requests / urllib3 are imported
 import os
 import warnings
@@ -6,7 +7,6 @@ import warnings
 if os.getenv("GITHUB_ACTIONS") == "true":
     from urllib3.exceptions import InsecureRequestWarning
     warnings.filterwarnings("ignore", category=InsecureRequestWarning)
-from __future__ import annotations
 import time
 import logging
 from pathlib import Path
