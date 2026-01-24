@@ -1,4 +1,6 @@
-# Python
+# ----------------------------
+# Python / venv
+# ----------------------------
 __pycache__/
 *.py[cod]
 *.pyd
@@ -9,27 +11,63 @@ venv/
 ENV/
 .env
 .env.*
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
+# ----------------------------
 # Jupyter
+# ----------------------------
 .ipynb_checkpoints/
 
-# Data / outputs
+# ----------------------------
+# OS
+# ----------------------------
+.DS_Store
+Thumbs.db
+
+# ----------------------------
+# Logs
+# ----------------------------
+*.log
+
+# ----------------------------
+# Packaging
+# ----------------------------
+dist/
+build/
+*.egg-info/
+
+# ----------------------------
+# Project data + generated outputs
+# (THIS is the important part for your repo)
+# ----------------------------
+
+# Raw/processed data buckets
 data/raw/
 data/interim/
 data/processed/
+
+# Your repo specifically has these (from git status)
+data/sample/raw/
+data/sample/derived/
+data/derived/
+
+# Model outputs / artifacts (your repo uses out/)
+out/
 outputs/
+
+# Model checkpoints
 *.pt
 *.pth
 *.onnx
 
-# OS
-.DS_Store
-Thumbs.db
+# Common large image artifacts
+*.png
+*.jpg
+*.jpeg
 
-# Logs
-*.log
-
-# Packaging
-dist/
-build/
-*.egg-info/
+# Optional: if you ever store videos/gifs
+*.mp4
+*.gif
