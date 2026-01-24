@@ -3,73 +3,39 @@ name: ingest-latest
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 */3 * * *"
 
 permissions:
   contents: write
 
-concurrency:
-  group: ingest-latest
-  cancel-in-progress: true
-
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
+          pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Debug import (src layout)
+      - name: Ingest via S3 mirror
         env:
           PYTHONPATH: src
-        run: |
-          python -c "import himawari_ml; import himawari_ml.ingest.fetch_latest as f; print('himawari_ml:', himawari_ml.__file__); print('fetch_latest:', f.__file__)"
-
-      - name: Ingest (catch up) + Build dataset + Report
-        env:
-          PYTHONPATH: src
-          # Mirror list (comma-separated). The script tries each until one works.
-          HIMAWARI_BASES: >-
-            http://himawari8-dl.nict.go.jp/himawari8/img,
-            http://himawari8.nict.go.jp/himawari8/img,
-            http://himawari8-data.nict.go.jp/himawari8/img
-
-          # More forgiving networking for Actions
-          HIMAWARI_TIMEOUT_S: "60"
-          HIMAWARI_RETRIES: "4"
-          HIMAWARI_BACKOFF_S: "2.0"
         run: |
           python -m himawari_ml.ingest.fetch_latest --lookback-hours 72 --max-frames 192
-          python -m himawari_ml.preprocess.build_dataset
-          python -m himawari_ml.evaluation.visualize_predictions
 
-      - name: Commit + push outputs
+      - name: Commit data
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
-
-          git pull --rebase || true
-
-          git add data out || true
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-
-          git commit -m "auto(ingest): update frames + artifacts"
+          git config user.name github-actions
+          git config user.email github-actions@users.noreply.github.com
+          git add data || true
+          git diff --cached --quiet && exit 0
+          git commit -m "auto(ingest): new Himawari frames"
           git push
-
