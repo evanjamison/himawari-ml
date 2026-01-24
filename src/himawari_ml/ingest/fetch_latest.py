@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -17,29 +18,46 @@ from himawari_ml.utils.logging import get_logger
 
 logger = get_logger()
 
-# ----------------------------
-# CONFIG — HTTP ONLY (NICT supports this)
-# ----------------------------
+# GitHub Actions env var is literally "true"
+_ON_GHA = os.getenv("GITHUB_ACTIONS") == "true"
+
+
 @dataclass(frozen=True)
 class HimawariConfig:
-    base: str = "http://himawari8-dl.nict.go.jp/himawari8/img"
-    product: str = "D531106"
-    level: str = "4d"
-    tile_px: int = 550
+    # IMPORTANT: use HTTP by default (NICT supports it, avoids TLS/cert issues on runners)
+    base: str = os.getenv("HIMAWARI_BASE", "http://himawari8-dl.nict.go.jp/himawari8/img")
+    product: str = os.getenv("HIMAWARI_PRODUCT", "D531106")
+    level: str = os.getenv("HIMAWARI_LEVEL", "4d")  # 4d -> 4x4 tiles
+    tile_px: int = int(os.getenv("HIMAWARI_TILE_PX", "550"))
 
-    timeout_s: int = 30
-    retries: int = 4
-    backoff_s: float = 1.5
+    timeout_s: int = int(os.getenv("HIMAWARI_TIMEOUT_S", "30"))
+    retries: int = int(os.getenv("HIMAWARI_RETRIES", "4"))
+    backoff_s: float = float(os.getenv("HIMAWARI_BACKOFF_S", "1.5"))
 
 
 CFG = HimawariConfig()
 
 
+def _force_http_if_needed(url: str) -> str:
+    """
+    On GitHub Actions, NICT TLS/cert validation is unreliable.
+    Force http:// even if something passes https://.
+    """
+    if _ON_GHA and url.startswith("https://"):
+        return "http://" + url[len("https://") :]
+    return url
+
+
 def _grid_n(level: str) -> int:
-    return int("".join(c for c in level if c.isdigit()))
+    digits = "".join(c for c in level if c.isdigit())
+    if not digits:
+        raise ValueError(f"Bad level: {level}")
+    return int(digits)
 
 
 def _request_bytes(url: str) -> bytes:
+    url = _force_http_if_needed(url)
+
     headers = {
         "User-Agent": "himawari-ml/1.0",
         "Cache-Control": "no-cache",
@@ -55,70 +73,88 @@ def _request_bytes(url: str) -> bytes:
         except Exception as e:
             last_err = e
             sleep = CFG.backoff_s * (2**i)
-            logger.warning(f"Fetch failed ({i+1}/{CFG.retries}) {url} → {e}; sleeping {sleep:.1f}s")
+            logger.warning(f"Fetch failed ({i+1}/{CFG.retries}) for {url} -> {e}. Sleeping {sleep:.1f}s")
             time.sleep(sleep)
 
     raise RuntimeError(f"Failed after {CFG.retries} retries: {url}") from last_err
 
 
 def _latest_timestamp_from_json() -> Optional[datetime]:
+    # cache-bust
     bust = int(time.time())
     url = f"{CFG.base}/{CFG.product}/latest.json?cb={bust}"
+    url = _force_http_if_needed(url)
+
     try:
         raw = _request_bytes(url)
         obj = json.loads(raw.decode("utf-8", errors="replace"))
-        date_str = obj.get("date")
+        date_str = obj.get("date") or obj.get("datetime") or obj.get("time")
         if not date_str:
+            logger.warning(f"latest.json missing date field. keys={list(obj.keys())}")
             return None
+
+        # NICT uses "YYYY-mm-dd HH:MM:SS"
+        date_str = date_str.replace("T", " ").replace("Z", "").strip()
         dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
         return dt.replace(tzinfo=timezone.utc)
+
     except Exception as e:
-        logger.warning(f"Could not fetch latest.json: {e}")
+        logger.warning(f"Could not fetch/parse latest.json: {e}")
         return None
 
 
 def _round_down(dt: datetime, minutes: int) -> datetime:
     dt = dt.replace(second=0, microsecond=0)
-    return dt.replace(minute=(dt.minute // minutes) * minutes)
+    minute = (dt.minute // minutes) * minutes
+    return dt.replace(minute=minute)
 
 
-def _candidate_times(anchor: Optional[datetime], lookback_hours: int, step_minutes: int):
+def _candidate_times(anchor: Optional[datetime], lookback_hours: int, step_minutes: int) -> list[datetime]:
     if anchor is None:
         anchor = datetime.now(timezone.utc)
     anchor = _round_down(anchor, step_minutes)
-    n = int((lookback_hours * 60) / step_minutes)
-    return [anchor - timedelta(minutes=i * step_minutes) for i in range(n + 1)]
+
+    n_steps = max(1, int((lookback_hours * 60) // step_minutes))
+    return [anchor - timedelta(minutes=step_minutes * k) for k in range(n_steps + 1)]
 
 
 def _tile_url(ts: datetime, x: int, y: int) -> str:
-    yyyy, mm, dd = ts.strftime("%Y"), ts.strftime("%m"), ts.strftime("%d")
+    yyyy = ts.strftime("%Y")
+    mm = ts.strftime("%m")
+    dd = ts.strftime("%d")
     hhmmss = ts.strftime("%H%M%S")
-    return (
+    url = (
         f"{CFG.base}/{CFG.product}/{CFG.level}/{CFG.tile_px}/"
         f"{yyyy}/{mm}/{dd}/{hhmmss}_{x}_{y}.png"
     )
+    return _force_http_if_needed(url)
 
 
 def _download_and_stitch(ts: datetime) -> Image.Image:
     n = _grid_n(CFG.level)
-    canvas = Image.new("RGB", (CFG.tile_px * n, CFG.tile_px * n))
+    canvas = Image.new("RGB", (CFG.tile_px * n, CFG.tile_px * n), color=(0, 0, 0))
 
     for y in range(n):
         for x in range(n):
+            url = _tile_url(ts, x, y)
             try:
-                raw = _request_bytes(_tile_url(ts, x, y))
-                tile = Image.open(BytesIO(raw)).convert("RGB")
+                b = _request_bytes(url)
+                tile = Image.open(BytesIO(b)).convert("RGB")
                 canvas.paste(tile, (x * CFG.tile_px, y * CFG.tile_px))
             except Exception as e:
-                logger.warning(f"Tile failed ({x},{y}): {e}")
+                logger.warning(f"Tile failed ({x},{y}) {url} -> {e}")
 
     return canvas
 
 
-def _looks_real(img: Image.Image) -> bool:
+def _looks_like_real_image(img: Image.Image) -> bool:
     small = img.resize((128, 128))
-    dark = sum(1 for p in small.getdata() if sum(p) < 15)
-    return dark / (128 * 128) < 0.98
+    near_black = 0
+    total = 128 * 128
+    for r, g, b in small.getdata():
+        if (r + g + b) < 15:
+            near_black += 1
+    return (near_black / total) < 0.98
 
 
 def _out_name(ts: datetime) -> str:
@@ -127,36 +163,45 @@ def _out_name(ts: datetime) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out-dir", default=str(data_dir() / "raw"))
+    ap.add_argument("--out-dir", default=str(data_dir() / "raw"), help="Directory to save mosaics")
     ap.add_argument("--lookback-hours", type=int, default=48)
     ap.add_argument("--step-minutes", type=int, default=10)
     ap.add_argument("--max-frames", type=int, default=96)
+    ap.add_argument("--no-latest-json", action="store_true")
     args = ap.parse_args()
 
     out_dir = ensure_dir(Path(args.out_dir))
-    anchor = _latest_timestamp_from_json()
-    times = _candidate_times(anchor, args.lookback_hours, args.step_minutes)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if _ON_GHA:
+        logger.warning(f"GITHUB_ACTIONS=true -> forcing HTTP. base={CFG.base}")
+
+    anchor = None if args.no_latest_json else _latest_timestamp_from_json()
+    candidates = _candidate_times(anchor, args.lookback_hours, args.step_minutes)
 
     saved = 0
-    for ts in times:
+    tried = 0
+    for ts in candidates:
         if saved >= args.max_frames:
             break
 
-        out = out_dir / _out_name(ts)
-        if out.exists():
+        out_path = out_dir / _out_name(ts)
+        if out_path.exists():
             continue
 
-        logger.info(f"Trying {ts.isoformat()}")
+        tried += 1
+        logger.info(f"[{tried}] Trying {ts.isoformat()} -> {out_path.name}")
         img = _download_and_stitch(ts)
-        if not _looks_real(img):
-            logger.info("Blank frame, skipping")
+
+        if not _looks_like_real_image(img):
+            logger.info("Looks blank-ish; skipping.")
             continue
 
-        img.save(out)
-        logger.info(f"Saved {out}")
+        img.save(out_path)
         saved += 1
+        logger.info(f"Saved: {out_path}")
 
-    logger.info(f"Done. saved={saved}")
+    logger.info(f"Done. saved={saved} tried={tried} out_dir={out_dir}")
     return 0
 
 
