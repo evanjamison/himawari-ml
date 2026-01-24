@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -10,9 +9,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
-import certifi
 import requests
-import urllib3
 from PIL import Image
 
 from himawari_ml.utils.io import data_dir, ensure_dir
@@ -20,18 +17,12 @@ from himawari_ml.utils.logging import get_logger
 
 logger = get_logger()
 
-# Silence warnings when SSL verify is intentionally disabled (GH Actions workaround)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-_ON_GHA = os.getenv("GITHUB_ACTIONS") == "true"
-
-
 # ----------------------------
-# Config
+# CONFIG — HTTP ONLY (NICT supports this)
 # ----------------------------
 @dataclass(frozen=True)
 class HimawariConfig:
-    base: str = "https://himawari8-dl.nict.go.jp/himawari8/img"
+    base: str = "http://himawari8-dl.nict.go.jp/himawari8/img"
     product: str = "D531106"
     level: str = "4d"
     tile_px: int = 550
@@ -40,56 +31,15 @@ class HimawariConfig:
     retries: int = 4
     backoff_s: float = 1.5
 
-    # If you absolutely must bypass SSL locally too:
-    # set ALLOW_INSECURE_SSL=1 (NOT recommended)
-    allow_insecure_ssl: bool = bool(int(os.getenv("ALLOW_INSECURE_SSL", "0") or "0"))
 
-
-CFG = HimawariConfig(
-    base=os.getenv("HIMAWARI_BASE", HimawariConfig.base),
-    product=os.getenv("HIMAWARI_PRODUCT", HimawariConfig.product),
-    level=os.getenv("HIMAWARI_LEVEL", HimawariConfig.level),
-    tile_px=int(os.getenv("HIMAWARI_TILE_PX", str(HimawariConfig.tile_px))),
-)
+CFG = HimawariConfig()
 
 
 def _grid_n(level: str) -> int:
-    digits = "".join([c for c in level if c.isdigit()])
-    if not digits:
-        raise ValueError(f"Bad level: {level}")
-    return int(digits)
+    return int("".join(c for c in level if c.isdigit()))
 
 
-def _ssl_verify_arg():
-    """
-    GitHub Actions runners sometimes fail to validate the NICT cert chain.
-    We *force* SSL verify off on Actions to keep ingest alive.
-
-    Local/default: verify with certifi CA bundle.
-    Local override: ALLOW_INSECURE_SSL=1 -> verify=False.
-    """
-    if _ON_GHA:
-        return False
-    if CFG.allow_insecure_ssl:
-        return False
-    return certifi.where()
-
-
-def _request_bytes(url: str, timeout_s: int, retries: int, backoff_s: float) -> bytes:
-    """
-    Robust downloader with retry.
-
-    - On GitHub Actions: verify=False (workaround for NICT cert-chain issue)
-    - Otherwise: verify=certifi.where()
-    - Sends no-cache headers to avoid stale latest.json
-    """
-    verify = _ssl_verify_arg()
-
-    # Log once so you can confirm Actions is actually bypassing verification
-    if _ON_GHA and not hasattr(_request_bytes, "_warned"):
-        logger.warning("GITHUB_ACTIONS detected -> SSL verification DISABLED for Himawari downloads")
-        _request_bytes._warned = True
-
+def _request_bytes(url: str) -> bytes:
     headers = {
         "User-Agent": "himawari-ml/1.0",
         "Cache-Control": "no-cache",
@@ -97,101 +47,78 @@ def _request_bytes(url: str, timeout_s: int, retries: int, backoff_s: float) -> 
     }
 
     last_err: Optional[Exception] = None
-    for i in range(retries):
+    for i in range(CFG.retries):
         try:
-            r = requests.get(url, timeout=timeout_s, verify=verify, headers=headers)
+            r = requests.get(url, timeout=CFG.timeout_s, headers=headers)
             r.raise_for_status()
             return r.content
         except Exception as e:
             last_err = e
-            sleep = backoff_s * (2**i)
-            logger.warning(f"Fetch failed ({i+1}/{retries}) for {url} -> {e}. Sleeping {sleep:.1f}s")
+            sleep = CFG.backoff_s * (2**i)
+            logger.warning(f"Fetch failed ({i+1}/{CFG.retries}) {url} → {e}; sleeping {sleep:.1f}s")
             time.sleep(sleep)
 
-    raise RuntimeError(f"Failed to fetch after {retries} retries: {url}") from last_err
+    raise RuntimeError(f"Failed after {CFG.retries} retries: {url}") from last_err
 
 
 def _latest_timestamp_from_json() -> Optional[datetime]:
-    """
-    Try to read latest.json (cache-busted). If it fails, return None and we'll fallback to now().
-    """
     bust = int(time.time())
     url = f"{CFG.base}/{CFG.product}/latest.json?cb={bust}"
     try:
-        raw = _request_bytes(url, CFG.timeout_s, CFG.retries, CFG.backoff_s)
+        raw = _request_bytes(url)
         obj = json.loads(raw.decode("utf-8", errors="replace"))
-
-        date_str = obj.get("date") or obj.get("datetime") or obj.get("time")
+        date_str = obj.get("date")
         if not date_str:
-            logger.warning(f"latest.json missing date field. keys={list(obj.keys())}")
             return None
-
-        date_str = date_str.replace("T", " ").replace("Z", "").strip()
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
-            try:
-                dt = datetime.strptime(date_str, fmt)
-                return dt.replace(tzinfo=timezone.utc)
-            except ValueError:
-                continue
-
-        logger.warning(f"Could not parse latest.json date: {date_str}")
-        return None
+        dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=timezone.utc)
     except Exception as e:
-        logger.warning(f"Could not fetch/parse latest.json ({url}): {e}")
+        logger.warning(f"Could not fetch latest.json: {e}")
         return None
 
 
 def _round_down(dt: datetime, minutes: int) -> datetime:
     dt = dt.replace(second=0, microsecond=0)
-    minute = (dt.minute // minutes) * minutes
-    return dt.replace(minute=minute)
+    return dt.replace(minute=(dt.minute // minutes) * minutes)
 
 
-def _candidate_times(anchor: Optional[datetime], lookback_hours: int, step_minutes: int) -> list[datetime]:
+def _candidate_times(anchor: Optional[datetime], lookback_hours: int, step_minutes: int):
     if anchor is None:
         anchor = datetime.now(timezone.utc)
     anchor = _round_down(anchor, step_minutes)
-
-    n_steps = max(1, int((lookback_hours * 60) // step_minutes))
-    return [anchor - timedelta(minutes=step_minutes * k) for k in range(n_steps + 1)]
+    n = int((lookback_hours * 60) / step_minutes)
+    return [anchor - timedelta(minutes=i * step_minutes) for i in range(n + 1)]
 
 
 def _tile_url(ts: datetime, x: int, y: int) -> str:
-    yyyy = ts.strftime("%Y")
-    mm = ts.strftime("%m")
-    dd = ts.strftime("%d")
+    yyyy, mm, dd = ts.strftime("%Y"), ts.strftime("%m"), ts.strftime("%d")
     hhmmss = ts.strftime("%H%M%S")
-    return f"{CFG.base}/{CFG.product}/{CFG.level}/{CFG.tile_px}/{yyyy}/{mm}/{dd}/{hhmmss}_{x}_{y}.png"
+    return (
+        f"{CFG.base}/{CFG.product}/{CFG.level}/{CFG.tile_px}/"
+        f"{yyyy}/{mm}/{dd}/{hhmmss}_{x}_{y}.png"
+    )
 
 
 def _download_and_stitch(ts: datetime) -> Image.Image:
     n = _grid_n(CFG.level)
-    canvas = Image.new("RGB", (CFG.tile_px * n, CFG.tile_px * n), color=(0, 0, 0))
+    canvas = Image.new("RGB", (CFG.tile_px * n, CFG.tile_px * n))
 
     for y in range(n):
         for x in range(n):
-            url = _tile_url(ts, x, y)
             try:
-                b = _request_bytes(url, CFG.timeout_s, CFG.retries, CFG.backoff_s)
-                tile = Image.open(BytesIO(b)).convert("RGB")
+                raw = _request_bytes(_tile_url(ts, x, y))
+                tile = Image.open(BytesIO(raw)).convert("RGB")
                 canvas.paste(tile, (x * CFG.tile_px, y * CFG.tile_px))
             except Exception as e:
-                logger.warning(f"Tile failed ({x},{y}) {url} -> {e}")
+                logger.warning(f"Tile failed ({x},{y}): {e}")
 
     return canvas
 
 
-def _looks_like_real_image(img: Image.Image) -> bool:
-    """
-    Reject mosaics that are almost entirely black (common when timestamp has missing tiles).
-    """
+def _looks_real(img: Image.Image) -> bool:
     small = img.resize((128, 128))
-    near_black = 0
-    total = 128 * 128
-    for r, g, b in small.getdata():
-        if (r + g + b) < 15:
-            near_black += 1
-    return (near_black / total) < 0.98
+    dark = sum(1 for p in small.getdata() if sum(p) < 15)
+    return dark / (128 * 128) < 0.98
 
 
 def _out_name(ts: datetime) -> str:
@@ -200,43 +127,36 @@ def _out_name(ts: datetime) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out-dir", default=str(data_dir() / "raw"), help="Directory to save mosaics")
-    ap.add_argument("--lookback-hours", type=int, default=48, help="How far back to search for frames")
-    ap.add_argument("--step-minutes", type=int, default=10, help="Timestamp step in minutes")
-    ap.add_argument("--max-frames", type=int, default=96, help="Max frames to save per run")
-    ap.add_argument("--no-latest-json", action="store_true", help="Skip latest.json and use now() as anchor")
+    ap.add_argument("--out-dir", default=str(data_dir() / "raw"))
+    ap.add_argument("--lookback-hours", type=int, default=48)
+    ap.add_argument("--step-minutes", type=int, default=10)
+    ap.add_argument("--max-frames", type=int, default=96)
     args = ap.parse_args()
 
     out_dir = ensure_dir(Path(args.out_dir))
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    anchor = None if args.no_latest_json else _latest_timestamp_from_json()
-    candidates = _candidate_times(anchor, args.lookback_hours, args.step_minutes)
+    anchor = _latest_timestamp_from_json()
+    times = _candidate_times(anchor, args.lookback_hours, args.step_minutes)
 
     saved = 0
-    tried = 0
-
-    for ts in candidates:
+    for ts in times:
         if saved >= args.max_frames:
             break
 
-        out_path = out_dir / _out_name(ts)
-        if out_path.exists():
+        out = out_dir / _out_name(ts)
+        if out.exists():
             continue
 
-        tried += 1
-        logger.info(f"[{tried}] Trying {ts.isoformat()} -> {out_path.name}")
+        logger.info(f"Trying {ts.isoformat()}")
         img = _download_and_stitch(ts)
-
-        if not _looks_like_real_image(img):
-            logger.info("Looks blank-ish; skipping.")
+        if not _looks_real(img):
+            logger.info("Blank frame, skipping")
             continue
 
-        img.save(out_path)
+        img.save(out)
+        logger.info(f"Saved {out}")
         saved += 1
-        logger.info(f"Saved: {out_path}")
 
-    logger.info(f"Done. saved={saved} tried={tried} out_dir={out_dir}")
+    logger.info(f"Done. saved={saved}")
     return 0
 
 
