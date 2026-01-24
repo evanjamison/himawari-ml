@@ -15,6 +15,7 @@ concurrency:
 jobs:
   ingest:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,7 +27,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -41,8 +42,6 @@ jobs:
       - name: Ingest (catch up) + Build dataset + Report
         env:
           PYTHONPATH: src
-          # 🔥 Unblock GH Actions SSL chain issue
-          ALLOW_INSECURE_SSL: "1"
         run: |
           python -m himawari_ml.ingest.fetch_latest --lookback-hours 72 --max-frames 192
           python -m himawari_ml.preprocess.build_dataset
@@ -63,3 +62,4 @@ jobs:
 
           git commit -m "auto(ingest): update frames + artifacts"
           git push
+

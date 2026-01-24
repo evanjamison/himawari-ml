@@ -12,12 +12,18 @@ from typing import Optional
 
 import certifi
 import requests
+import urllib3
 from PIL import Image
 
 from himawari_ml.utils.io import data_dir, ensure_dir
 from himawari_ml.utils.logging import get_logger
 
 logger = get_logger()
+
+# Silence warnings when SSL verify is intentionally disabled (GH Actions workaround)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+_ON_GHA = os.getenv("GITHUB_ACTIONS") == "true"
 
 
 # ----------------------------
@@ -34,8 +40,8 @@ class HimawariConfig:
     retries: int = 4
     backoff_s: float = 1.5
 
-    # If you absolutely must bypass SSL in an emergency:
-    # set ALLOW_INSECURE_SSL=1 (NOT recommended for normal use)
+    # If you absolutely must bypass SSL locally too:
+    # set ALLOW_INSECURE_SSL=1 (NOT recommended)
     allow_insecure_ssl: bool = bool(int(os.getenv("ALLOW_INSECURE_SSL", "0") or "0"))
 
 
@@ -54,15 +60,35 @@ def _grid_n(level: str) -> int:
     return int(digits)
 
 
+def _ssl_verify_arg():
+    """
+    GitHub Actions runners sometimes fail to validate the NICT cert chain.
+    We *force* SSL verify off on Actions to keep ingest alive.
+
+    Local/default: verify with certifi CA bundle.
+    Local override: ALLOW_INSECURE_SSL=1 -> verify=False.
+    """
+    if _ON_GHA:
+        return False
+    if CFG.allow_insecure_ssl:
+        return False
+    return certifi.where()
+
+
 def _request_bytes(url: str, timeout_s: int, retries: int, backoff_s: float) -> bytes:
     """
-    Robust downloader with retry + correct cert chain handling on GitHub Actions.
+    Robust downloader with retry.
 
-    - Default: verify with certifi.where() (works reliably on GH Actions).
-    - Emergency override: ALLOW_INSECURE_SSL=1 -> verify=False (not recommended).
-    - Sends no-cache headers to avoid stale latest.json.
+    - On GitHub Actions: verify=False (workaround for NICT cert-chain issue)
+    - Otherwise: verify=certifi.where()
+    - Sends no-cache headers to avoid stale latest.json
     """
-    verify = False if CFG.allow_insecure_ssl else certifi.where()
+    verify = _ssl_verify_arg()
+
+    # Log once so you can confirm Actions is actually bypassing verification
+    if _ON_GHA and not hasattr(_request_bytes, "_warned"):
+        logger.warning("GITHUB_ACTIONS detected -> SSL verification DISABLED for Himawari downloads")
+        _request_bytes._warned = True
 
     headers = {
         "User-Agent": "himawari-ml/1.0",
@@ -216,4 +242,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
