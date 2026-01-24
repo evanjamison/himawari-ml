@@ -73,6 +73,10 @@ def _merge_anomaly_labels(df: pd.DataFrame, labeled_csv: Path) -> pd.DataFrame:
 
     merged = out.merge(labeled, on="relpath", how="left", suffixes=("", "_lbl"))
 
+    # If IF labels exist, use them for overlay; otherwise fall back to is_bad_frame
+    if "is_bad_iforest" in merged.columns:
+        merged["is_bad_frame"] = merged["is_bad_iforest"].fillna(False).astype(bool)
+
     if "is_bad_frame_lbl" in merged.columns:
         merged["is_bad_frame"] = merged["is_bad_frame_lbl"]
         merged = merged.drop(columns=["is_bad_frame_lbl"])
