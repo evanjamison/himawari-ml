@@ -15,7 +15,7 @@ concurrency:
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -33,17 +33,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Debug import + base (proves which file is used)
+      - name: Debug import (src layout)
         env:
           PYTHONPATH: src
-          HIMAWARI_BASE: http://himawari8-dl.nict.go.jp/himawari8/img
         run: |
-          python -c "import himawari_ml; import himawari_ml.ingest.fetch_latest as f; print('himawari_ml:', himawari_ml.__file__); print('fetch_latest:', f.__file__); print('BASE:', f.CFG.base)"
+          python -c "import himawari_ml; import himawari_ml.ingest.fetch_latest as f; print('himawari_ml:', himawari_ml.__file__); print('fetch_latest:', f.__file__)"
 
       - name: Ingest (catch up) + Build dataset + Report
         env:
           PYTHONPATH: src
-          HIMAWARI_BASE: http://himawari8-dl.nict.go.jp/himawari8/img
+          # Mirror list (comma-separated). The script tries each until one works.
+          HIMAWARI_BASES: >-
+            http://himawari8-dl.nict.go.jp/himawari8/img,
+            http://himawari8.nict.go.jp/himawari8/img,
+            http://himawari8-data.nict.go.jp/himawari8/img
+
+          # More forgiving networking for Actions
+          HIMAWARI_TIMEOUT_S: "60"
+          HIMAWARI_RETRIES: "4"
+          HIMAWARI_BACKOFF_S: "2.0"
         run: |
           python -m himawari_ml.ingest.fetch_latest --lookback-hours 72 --max-frames 192
           python -m himawari_ml.preprocess.build_dataset
@@ -55,8 +63,8 @@ jobs:
           git config user.email "github-actions@users.noreply.github.com"
 
           git pull --rebase || true
-          git add data out || true
 
+          git add data out || true
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
@@ -64,3 +72,4 @@ jobs:
 
           git commit -m "auto(ingest): update frames + artifacts"
           git push
+
