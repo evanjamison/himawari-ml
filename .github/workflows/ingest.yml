@@ -1,60 +1,68 @@
 name: ingest-latest
 
 on:
-  schedule:
-    - cron: "*/10 * * * *" # every 10 minutes
   workflow_dispatch:
-
-permissions:
-  contents: write
-
-concurrency:
-  group: ingest-latest
-  cancel-in-progress: true
+  schedule:
+    # Every 30 minutes (Himawari updates every 10 min, this is safe)
+    - cron: "*/30 * * * *"
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
 
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    permissions:
+      contents: write
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Ingest (catch up) + Build dataset + Report
+      # 🔑 THIS IS THE CRITICAL FIX
+      - name: Verify src layout + imports
         env:
-          IMAGE_SIZE: "512"
-          SEED: "42"
-          # Optional overrides:
-          # HIMAWARI_PRODUCT: "D531106"
-          # HIMAWARI_LEVEL: "4d"
+          PYTHONPATH: src
         run: |
-          python -m himawari_ml.ingest.fetch_latest --lookback-hours 48 --max-frames 96
-          python -m himawari_ml.preprocess.build_dataset
-          python -m himawari_ml.evaluation.visualize_predictions
+          python - <<'EOF'
+          import sys
+          print("PYTHONPATH:", sys.path)
+          import himawari_ml
+          print("himawari_ml loaded from:", himawari_ml.__file__)
+          EOF
 
-      - name: Commit + push outputs
+      - name: Ingest latest frames (catch-up)
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m himawari_ml.ingest.fetch_latest \
+            --lookback-hours 72 \
+            --max-frames 192
+
+      - name: Build dataset
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m himawari_ml.preprocess.build_dataset
+
+      - name: Commit & push new data (if changed)
         run: |
           git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
+          git config user.email "github-actions@github.com"
 
-          # Avoid push failures if remote advanced
-          git pull --rebase || true
+          git add data out || true
 
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
-            git commit -m "chore: ingest + update artifacts"
-            git push
+          if git diff --cached --quiet; then
+            echo "No new data to commit"
           else
-            echo "No changes to commit."
+            git commit -m "auto(ingest): add new Himawari frames"
+            git push
           fi
-
