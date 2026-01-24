@@ -2,14 +2,24 @@ name: ingest-latest
 
 on:
   schedule:
-    - cron: "0 * * * *" # hourly
+    - cron: "*/10 * * * *" # every 10 minutes
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ingest-latest
+  cancel-in-progress: true
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -20,20 +30,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Ingest + Build dataset + Report
+      - name: Ingest (catch up) + Build dataset + Report
         env:
-          HIMAWARI_SAMPLE_URL: ${{ secrets.HIMAWARI_SAMPLE_URL }}
           IMAGE_SIZE: "512"
           SEED: "42"
+          # Optional overrides:
+          # HIMAWARI_PRODUCT: "D531106"
+          # HIMAWARI_LEVEL: "4d"
         run: |
-          python -m himawari_ml.ingest.fetch_latest
+          python -m himawari_ml.ingest.fetch_latest --lookback-hours 48 --max-frames 96
           python -m himawari_ml.preprocess.build_dataset
           python -m himawari_ml.evaluation.visualize_predictions
 
-      - name: Commit outputs (optional)
+      - name: Commit + push outputs
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
-          git add -A
-          git commit -m "chore: ingest + update artifacts" || echo "No changes to commit"
-          git push || echo "No push (forks/permissions)"
+
+          # Avoid push failures if remote advanced
+          git pull --rebase || true
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "chore: ingest + update artifacts"
+            git push
+          else
+            echo "No changes to commit."
+          fi
+

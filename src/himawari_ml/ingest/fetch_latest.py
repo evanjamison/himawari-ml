@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import time
@@ -8,7 +9,9 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
+
 from dotenv import load_dotenv
+
 load_dotenv()
 
 import certifi
@@ -30,7 +33,7 @@ class HimawariConfig:
     # NICT tile server base
     base: str = "https://himawari8-dl.nict.go.jp/himawari8/img"
 
-    # Product folder (commonly used full-disk product on NICT tiles)
+    # Product folder on NICT tiles
     product: str = "D531106"
 
     # Tile grid size: 1d->1x1, 2d->2x2, 4d->4x4, 8d->8x8, ...
@@ -41,19 +44,23 @@ class HimawariConfig:
 
     # Request timeouts and retry behavior
     timeout_s: int = 30
-    retries: int = 3
+    retries: int = 4
     backoff_s: float = 1.5
 
-    # Dev-only: allow insecure SSL (workaround for SSL-intercepted networks)
-    allow_insecure_ssl: bool = os.getenv("ALLOW_INSECURE_SSL", "0") == "1"
+    # Dev-only override
+    allow_insecure_ssl: bool = bool(int(os.getenv("ALLOW_INSECURE_SSL", "0") or "0"))
 
 
-CFG = HimawariConfig()
+CFG = HimawariConfig(
+    base=os.getenv("HIMAWARI_BASE", HimawariConfig.base),
+    product=os.getenv("HIMAWARI_PRODUCT", HimawariConfig.product),
+    level=os.getenv("HIMAWARI_LEVEL", HimawariConfig.level),
+    tile_px=int(os.getenv("HIMAWARI_TILE_PX", str(HimawariConfig.tile_px))),
+)
 
-# If insecure mode, silence warnings (dev only!)
+
 if CFG.allow_insecure_ssl:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    logger.warning("ALLOW_INSECURE_SSL=1 -> SSL verification DISABLED (dev-only).")
 
 
 # ----------------------------
@@ -69,23 +76,28 @@ def _grid_n(level: str) -> int:
 def _request_bytes(url: str, timeout_s: int, retries: int, backoff_s: float) -> bytes:
     """
     Download bytes with retry.
+    - Uses no-cache headers to avoid stale latest.json / CDN caching.
     - Secure default: verify with certifi CA bundle
     - Dev-only override: verify=False when ALLOW_INSECURE_SSL=1
     """
     last_err: Optional[Exception] = None
     verify = False if CFG.allow_insecure_ssl else certifi.where()
 
+    headers = {
+        "User-Agent": "himawari-ml/1.0 (+https://github.com/)",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
     for i in range(retries):
         try:
-            r = requests.get(url, timeout=timeout_s, verify=verify)
+            r = requests.get(url, timeout=timeout_s, verify=verify, headers=headers)
             r.raise_for_status()
             return r.content
         except Exception as e:
             last_err = e
             sleep = backoff_s * (2**i)
-            logger.warning(
-                f"Fetch failed ({i+1}/{retries}) for {url} -> {e}. Sleeping {sleep:.1f}s"
-            )
+            logger.warning(f"Fetch failed ({i+1}/{retries}) for {url} -> {e}. Sleeping {sleep:.1f}s")
             time.sleep(sleep)
 
     raise RuntimeError(f"Failed to fetch after {retries} retries: {url}") from last_err
@@ -95,8 +107,12 @@ def _latest_timestamp_from_json() -> Optional[datetime]:
     """
     NICT provides a 'latest.json' for some products (e.g., D531106).
     If reachable, this is the cleanest way to know what timestamp to request.
+    We add a cache-buster query param and no-cache headers above.
     """
-    url = f"{CFG.base}/{CFG.product}/latest.json"
+    # cache buster to avoid GH runner / CDN returning stale json
+    bust = int(time.time())
+    url = f"{CFG.base}/{CFG.product}/latest.json?cb={bust}"
+
     try:
         raw = _request_bytes(url, CFG.timeout_s, CFG.retries, CFG.backoff_s)
         obj = json.loads(raw.decode("utf-8", errors="replace"))
@@ -122,20 +138,26 @@ def _latest_timestamp_from_json() -> Optional[datetime]:
         return None
 
 
-def _round_down_to_10min(dt: datetime) -> datetime:
+def _round_down(dt: datetime, minutes: int) -> datetime:
     dt = dt.replace(second=0, microsecond=0)
-    minute = (dt.minute // 10) * 10
+    minute = (dt.minute // minutes) * minutes
     return dt.replace(minute=minute)
 
 
-def _candidate_times_fallback(n_back: int = 18) -> list[datetime]:
+def _candidate_times(
+    anchor: Optional[datetime],
+    lookback_hours: int,
+    step_minutes: int,
+) -> list[datetime]:
     """
-    If latest.json fails, try now (UTC) rounded down to 10 minutes,
-    then step backwards in 10-minute increments.
+    Generate timestamps going backwards from anchor in step_minutes increments.
     """
-    now = datetime.now(timezone.utc)
-    t0 = _round_down_to_10min(now)
-    return [t0 - timedelta(minutes=10 * k) for k in range(n_back)]
+    if anchor is None:
+        anchor = datetime.now(timezone.utc)
+    anchor = _round_down(anchor, step_minutes)
+
+    n_steps = max(1, int((lookback_hours * 60) // step_minutes))
+    return [anchor - timedelta(minutes=step_minutes * k) for k in range(n_steps + 1)]
 
 
 def _tile_url(ts: datetime, x: int, y: int) -> str:
@@ -162,6 +184,7 @@ def _download_and_stitch(ts: datetime) -> Image.Image:
                 tile = Image.open(BytesIO(b)).convert("RGB")
                 canvas.paste(tile, (x * CFG.tile_px, y * CFG.tile_px))
             except Exception as e:
+                # Missing tiles happen; still produce mosaic, but may be blank-ish.
                 logger.warning(f"Tile missing/failed: ({x},{y}) {url} -> {e}")
 
     return canvas
@@ -181,32 +204,51 @@ def _looks_like_real_image(img: Image.Image) -> bool:
     return (near_black / total) < 0.98
 
 
+def _out_name(ts: datetime) -> str:
+    return f"himawari_{CFG.product}_{CFG.level}_{ts.strftime('%Y%m%d_%H%M%S')}Z.png"
+
+
 def main() -> int:
-    raw_dir = ensure_dir(data_dir() / "raw")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out-dir", default=str(data_dir() / "raw"), help="Directory to save mosaics")
+    ap.add_argument("--lookback-hours", type=int, default=48, help="How far back to search for frames")
+    ap.add_argument("--step-minutes", type=int, default=10, help="Timestamp step in minutes (Himawari is usually 10)")
+    ap.add_argument("--max-frames", type=int, default=96, help="Max frames to save per run (caps repo growth)")
+    ap.add_argument("--no-latest-json", action="store_true", help="Skip latest.json and use now() as anchor")
+    args = ap.parse_args()
 
-    ts = _latest_timestamp_from_json()
-    candidates = [ts] if ts else _candidate_times_fallback(n_back=18)
+    raw_dir = ensure_dir(Path(args.out_dir))
+    raw_dir.mkdir(parents=True, exist_ok=True)
 
-    last_img: Optional[Image.Image] = None
-    last_ts: Optional[datetime] = None
+    anchor = None
+    if not args.no_latest_json:
+        anchor = _latest_timestamp_from_json()
 
+    candidates = _candidate_times(anchor, lookback_hours=args.lookback_hours, step_minutes=args.step_minutes)
+
+    saved = 0
+    checked = 0
     for t in candidates:
-        logger.info(f"Attempting timestamp: {t.isoformat()}")
-        img = _download_and_stitch(t)
-        last_img, last_ts = img, t
-
-        if _looks_like_real_image(img):
-            logger.info("Image sanity check passed.")
+        if saved >= args.max_frames:
             break
-        logger.warning("Image looks mostly blank; trying an earlier timestamp...")
 
-    if last_img is None or last_ts is None:
-        raise SystemExit("Failed to build any mosaic image (no candidates worked).")
+        out_path = raw_dir / _out_name(t)
+        if out_path.exists():
+            continue  # already have it
 
-    out_name = f"himawari_{CFG.product}_{CFG.level}_{last_ts.strftime('%Y%m%d_%H%M%S')}Z.png"
-    out_path = raw_dir / out_name
-    last_img.save(out_path)
-    logger.info(f"Saved stitched image: {out_path}")
+        checked += 1
+        logger.info(f"[{checked}] Trying {t.isoformat()} -> {out_path.name}")
+        img = _download_and_stitch(t)
+
+        if not _looks_like_real_image(img):
+            logger.info("Looks blank-ish; skipping.")
+            continue
+
+        img.save(out_path)
+        saved += 1
+        logger.info(f"Saved: {out_path}")
+
+    logger.info(f"Done. saved={saved} checked={checked} out_dir={raw_dir}")
     return 0
 
 
