@@ -10,13 +10,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 import certifi
 import requests
-import urllib3
 from PIL import Image
 
 from himawari_ml.utils.io import data_dir, ensure_dir
@@ -26,28 +21,21 @@ logger = get_logger()
 
 
 # ----------------------------
-# Config (simple + explicit)
+# Config
 # ----------------------------
 @dataclass(frozen=True)
 class HimawariConfig:
-    # NICT tile server base
     base: str = "https://himawari8-dl.nict.go.jp/himawari8/img"
-
-    # Product folder on NICT tiles
     product: str = "D531106"
-
-    # Tile grid size: 1d->1x1, 2d->2x2, 4d->4x4, 8d->8x8, ...
     level: str = "4d"
-
-    # Each tile is width x width pixels (commonly 550)
     tile_px: int = 550
 
-    # Request timeouts and retry behavior
     timeout_s: int = 30
     retries: int = 4
     backoff_s: float = 1.5
 
-    # Dev-only override
+    # If you absolutely must bypass SSL in an emergency:
+    # set ALLOW_INSECURE_SSL=1 (NOT recommended for normal use)
     allow_insecure_ssl: bool = bool(int(os.getenv("ALLOW_INSECURE_SSL", "0") or "0"))
 
 
@@ -59,13 +47,6 @@ CFG = HimawariConfig(
 )
 
 
-if CFG.allow_insecure_ssl:
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-
-# ----------------------------
-# Helpers
-# ----------------------------
 def _grid_n(level: str) -> int:
     digits = "".join([c for c in level if c.isdigit()])
     if not digits:
@@ -75,20 +56,21 @@ def _grid_n(level: str) -> int:
 
 def _request_bytes(url: str, timeout_s: int, retries: int, backoff_s: float) -> bytes:
     """
-    Download bytes with retry.
-    - Uses no-cache headers to avoid stale latest.json / CDN caching.
-    - Secure default: verify with certifi CA bundle
-    - Dev-only override: verify=False when ALLOW_INSECURE_SSL=1
+    Robust downloader with retry + correct cert chain handling on GitHub Actions.
+
+    - Default: verify with certifi.where() (works reliably on GH Actions).
+    - Emergency override: ALLOW_INSECURE_SSL=1 -> verify=False (not recommended).
+    - Sends no-cache headers to avoid stale latest.json.
     """
-    last_err: Optional[Exception] = None
     verify = False if CFG.allow_insecure_ssl else certifi.where()
 
     headers = {
-        "User-Agent": "himawari-ml/1.0 (+https://github.com/)",
+        "User-Agent": "himawari-ml/1.0",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
 
+    last_err: Optional[Exception] = None
     for i in range(retries):
         try:
             r = requests.get(url, timeout=timeout_s, verify=verify, headers=headers)
@@ -105,21 +87,17 @@ def _request_bytes(url: str, timeout_s: int, retries: int, backoff_s: float) -> 
 
 def _latest_timestamp_from_json() -> Optional[datetime]:
     """
-    NICT provides a 'latest.json' for some products (e.g., D531106).
-    If reachable, this is the cleanest way to know what timestamp to request.
-    We add a cache-buster query param and no-cache headers above.
+    Try to read latest.json (cache-busted). If it fails, return None and we'll fallback to now().
     """
-    # cache buster to avoid GH runner / CDN returning stale json
     bust = int(time.time())
     url = f"{CFG.base}/{CFG.product}/latest.json?cb={bust}"
-
     try:
         raw = _request_bytes(url, CFG.timeout_s, CFG.retries, CFG.backoff_s)
         obj = json.loads(raw.decode("utf-8", errors="replace"))
 
         date_str = obj.get("date") or obj.get("datetime") or obj.get("time")
         if not date_str:
-            logger.warning(f"latest.json missing recognizable datetime field: keys={list(obj.keys())}")
+            logger.warning(f"latest.json missing date field. keys={list(obj.keys())}")
             return None
 
         date_str = date_str.replace("T", " ").replace("Z", "").strip()
@@ -130,9 +108,8 @@ def _latest_timestamp_from_json() -> Optional[datetime]:
             except ValueError:
                 continue
 
-        logger.warning(f"Could not parse date format from latest.json: {date_str}")
+        logger.warning(f"Could not parse latest.json date: {date_str}")
         return None
-
     except Exception as e:
         logger.warning(f"Could not fetch/parse latest.json ({url}): {e}")
         return None
@@ -144,14 +121,7 @@ def _round_down(dt: datetime, minutes: int) -> datetime:
     return dt.replace(minute=minute)
 
 
-def _candidate_times(
-    anchor: Optional[datetime],
-    lookback_hours: int,
-    step_minutes: int,
-) -> list[datetime]:
-    """
-    Generate timestamps going backwards from anchor in step_minutes increments.
-    """
+def _candidate_times(anchor: Optional[datetime], lookback_hours: int, step_minutes: int) -> list[datetime]:
     if anchor is None:
         anchor = datetime.now(timezone.utc)
     anchor = _round_down(anchor, step_minutes)
@@ -161,10 +131,6 @@ def _candidate_times(
 
 
 def _tile_url(ts: datetime, x: int, y: int) -> str:
-    """
-    Tile URL format:
-      {base}/{product}/{level}/{tile_px}/{YYYY}/{MM}/{DD}/{HHMMSS}_{x}_{y}.png
-    """
     yyyy = ts.strftime("%Y")
     mm = ts.strftime("%m")
     dd = ts.strftime("%d")
@@ -184,21 +150,19 @@ def _download_and_stitch(ts: datetime) -> Image.Image:
                 tile = Image.open(BytesIO(b)).convert("RGB")
                 canvas.paste(tile, (x * CFG.tile_px, y * CFG.tile_px))
             except Exception as e:
-                # Missing tiles happen; still produce mosaic, but may be blank-ish.
-                logger.warning(f"Tile missing/failed: ({x},{y}) {url} -> {e}")
+                logger.warning(f"Tile failed ({x},{y}) {url} -> {e}")
 
     return canvas
 
 
 def _looks_like_real_image(img: Image.Image) -> bool:
     """
-    Reject images that are almost entirely black (helps avoid saving blank mosaics).
+    Reject mosaics that are almost entirely black (common when timestamp has missing tiles).
     """
     small = img.resize((128, 128))
-    px = small.getdata()
     near_black = 0
     total = 128 * 128
-    for r, g, b in px:
+    for r, g, b in small.getdata():
         if (r + g + b) < 15:
             near_black += 1
     return (near_black / total) < 0.98
@@ -212,33 +176,31 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default=str(data_dir() / "raw"), help="Directory to save mosaics")
     ap.add_argument("--lookback-hours", type=int, default=48, help="How far back to search for frames")
-    ap.add_argument("--step-minutes", type=int, default=10, help="Timestamp step in minutes (Himawari is usually 10)")
-    ap.add_argument("--max-frames", type=int, default=96, help="Max frames to save per run (caps repo growth)")
+    ap.add_argument("--step-minutes", type=int, default=10, help="Timestamp step in minutes")
+    ap.add_argument("--max-frames", type=int, default=96, help="Max frames to save per run")
     ap.add_argument("--no-latest-json", action="store_true", help="Skip latest.json and use now() as anchor")
     args = ap.parse_args()
 
-    raw_dir = ensure_dir(Path(args.out_dir))
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = ensure_dir(Path(args.out_dir))
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    anchor = None
-    if not args.no_latest_json:
-        anchor = _latest_timestamp_from_json()
-
-    candidates = _candidate_times(anchor, lookback_hours=args.lookback_hours, step_minutes=args.step_minutes)
+    anchor = None if args.no_latest_json else _latest_timestamp_from_json()
+    candidates = _candidate_times(anchor, args.lookback_hours, args.step_minutes)
 
     saved = 0
-    checked = 0
-    for t in candidates:
+    tried = 0
+
+    for ts in candidates:
         if saved >= args.max_frames:
             break
 
-        out_path = raw_dir / _out_name(t)
+        out_path = out_dir / _out_name(ts)
         if out_path.exists():
-            continue  # already have it
+            continue
 
-        checked += 1
-        logger.info(f"[{checked}] Trying {t.isoformat()} -> {out_path.name}")
-        img = _download_and_stitch(t)
+        tried += 1
+        logger.info(f"[{tried}] Trying {ts.isoformat()} -> {out_path.name}")
+        img = _download_and_stitch(ts)
 
         if not _looks_like_real_image(img):
             logger.info("Looks blank-ish; skipping.")
@@ -248,9 +210,10 @@ def main() -> int:
         saved += 1
         logger.info(f"Saved: {out_path}")
 
-    logger.info(f"Done. saved={saved} checked={checked} out_dir={raw_dir}")
+    logger.info(f"Done. saved={saved} tried={tried} out_dir={out_dir}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
