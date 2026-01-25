@@ -1,12 +1,15 @@
 # src/himawari_ml/ingest/fetch_latest.py
 from __future__ import annotations
+
 # MUST be first — before requests / urllib3 are imported
 import os
 import warnings
 
 if os.getenv("GITHUB_ACTIONS") == "true":
     from urllib3.exceptions import InsecureRequestWarning
+
     warnings.filterwarnings("ignore", category=InsecureRequestWarning)
+
 import time
 import logging
 from pathlib import Path
@@ -27,34 +30,33 @@ BASES = [
     "https://himawari8.nict.go.jp/himawari8/img",
 ]
 
-HEADERS = {
-    "User-Agent": "himawari-ml/1.0 (research; GitHub Actions)"
-}
+HEADERS = {"User-Agent": "himawari-ml/1.0 (research; GitHub Actions)"}
 
 # In Actions, NICT sometimes fails TLS chain validation; locally it usually works.
 VERIFY_SSL = not IN_GHA
 
-# If you want to keep everything even if it’s mostly black, set to 1.0
-# Default 0.98 = skip frames that are ~98% near-black after resize.
-SKIP_DARK_FRAC = float(os.getenv("SKIP_DARK_FRAC", "0.98"))
+# ---- Controls to prevent Actions from running forever ----
+# Stop after saving this many frames (Actions-friendly).
+TARGET_SAVED = int(os.getenv("TARGET_SAVED", "48"))
+
+# Skip frames that are too dark (night side). Lower = stricter.
+# NOTE: keep backward compat with your older env name SKIP_DARK_FRAC.
+MAX_DARK_FRAC = float(os.getenv("MAX_DARK_FRAC", os.getenv("SKIP_DARK_FRAC", "0.92")))
 
 
 def _get(url: str, retries: int = 4, timeout: int = 30) -> requests.Response:
     last_err: Exception | None = None
     for i in range(retries):
         try:
-            r = requests.get(
-                url,
-                headers=HEADERS,
-                timeout=timeout,
-                verify=VERIFY_SSL,
-            )
+            r = requests.get(url, headers=HEADERS, timeout=timeout, verify=VERIFY_SSL)
             r.raise_for_status()
             return r
         except Exception as e:
             last_err = e
-            log.warning(f"Fetch failed ({i+1}/{retries}) for {url} -> {e}")
-            time.sleep(2 ** i)
+            # Only warn on final attempt to avoid log explosion in Actions
+            if i == retries - 1:
+                log.warning(f"Fetch failed after {retries} retries: {url} -> {e}")
+            time.sleep(2**i)
     raise RuntimeError(f"Failed after {retries} retries: {url} ({last_err})")
 
 
@@ -73,12 +75,12 @@ def _center_crop_square(img: Image.Image) -> Image.Image:
     return img.crop((left, top, left + side, top + side))
 
 
-def _dark_fraction(img256: Image.Image) -> float:
+def _dark_fraction(img: Image.Image) -> float:
     """
-    Fraction of pixels that are near-black in a 256x256 RGB image.
-    Avoids numpy dependency by using PIL convert to L and histogram.
+    Fraction of pixels that are near-black in an RGB image.
+    Uses PIL only (no numpy).
     """
-    g = img256.convert("L")
+    g = img.convert("L")
     hist = g.histogram()  # 256 bins
     total = sum(hist)
     if total == 0:
@@ -95,10 +97,9 @@ def fetch_frame(ts: datetime, out_dir: Path, image_size: int = 256) -> bool:
     y, m, d = ts.strftime("%Y"), ts.strftime("%m"), ts.strftime("%d")
     hms = ts.strftime("%H%M%S")
 
-    # 4d/550 => 4x4 tiles, each 550px => stitched 2200x2200
     level = 4
     tile_size = 550
-    n = level  # tiles are 0..3
+    n = level  # tiles: 0..3
 
     rel_prefix = f"D531106/{level}d/{tile_size}/{y}/{m}/{d}/{hms}"
 
@@ -107,7 +108,6 @@ def fetch_frame(ts: datetime, out_dir: Path, image_size: int = 256) -> bool:
 
     for base in BASES:
         try:
-            # Download tiles row-major (y then x)
             tiles: list[list[Image.Image]] = []
             for yy in range(n):
                 row: list[Image.Image] = []
@@ -118,25 +118,20 @@ def fetch_frame(ts: datetime, out_dir: Path, image_size: int = 256) -> bool:
                     row.append(im)
                 tiles.append(row)
 
-            # Stitch
             full = Image.new("RGB", (n * tile_size, n * tile_size))
             for yy in range(n):
                 for xx in range(n):
                     full.paste(tiles[yy][xx], (xx * tile_size, yy * tile_size))
 
-            # Crop + resize for ML
             cropped = _center_crop_square(full)
-            img256 = cropped.resize((image_size, image_size), Image.BILINEAR)
+            resized = cropped.resize((image_size, image_size), Image.BILINEAR)
 
-            # Optional: skip mostly-black frames
-            dark_frac = _dark_fraction(img256)
-            if dark_frac >= SKIP_DARK_FRAC:
-                log.warning(
-                    f"Skipping mostly-dark frame {hms} (dark_frac={dark_frac:.3f}) from base={base}"
-                )
+            dark_frac = _dark_fraction(resized)
+            if dark_frac > MAX_DARK_FRAC:
+                log.info(f"Skip {path.name} (dark_frac={dark_frac:.3f} > {MAX_DARK_FRAC})")
                 return False
 
-            img256.save(path)
+            resized.save(path)
             log.info(f"Saved {path} (dark_frac={dark_frac:.3f})")
             return True
 
@@ -150,26 +145,23 @@ def fetch_frame(ts: datetime, out_dir: Path, image_size: int = 256) -> bool:
 def main(lookback_hours: int = 72, max_frames: int = 192, image_size: int = 256):
     out = Path("data/raw")
     ts = latest_timestamp()
-
-    saved = 0
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
 
-    for _ in range(max_frames):
-        if ts < cutoff:
-            break
+    saved = 0
+    checked = 0
 
+    while checked < max_frames and ts >= cutoff and saved < TARGET_SAVED:
+        checked += 1
         if fetch_frame(ts, out, image_size=image_size):
             saved += 1
-
         ts -= timedelta(minutes=10)
 
-    log.info(f"Done. Saved {saved} frames.")
+    log.info(f"Done. Saved {saved} frames (checked {checked}).")
 
 
 if __name__ == "__main__":
-    # Optional CLI overrides without introducing argparse dependency in the module API
-    # Usage example:
-    #   python -m himawari_ml.ingest.fetch_latest 72 192 256
+    # Usage:
+    #   python -m himawari_ml.ingest.fetch_latest 12 192 256
     import sys
 
     try:

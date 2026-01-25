@@ -3,7 +3,8 @@ name: ingest-latest
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    # every 2 hours (UTC). adjust if you want.
+    - cron: "0 */2 * * *"
 
 permissions:
   contents: read
@@ -11,7 +12,7 @@ permissions:
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -21,25 +22,31 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      - name: Install dependencies
+      - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install requests pillow numpy pandas matplotlib
+          # install your project (src layout) so python -m himawari_ml... works
           pip install -e .
+          # if you have requirements.txt, install it too (safe if missing)
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Ingest via NICT CDN
         env:
-          GITHUB_ACTIONS: "true"
+          # ✅ stop early so Actions doesn't run 20 minutes
+          TARGET_SAVED: "48"
+          # ✅ skip night-side / mostly-black frames
+          MAX_DARK_FRAC: "0.92"
         run: |
-          python -m himawari_ml.ingest.fetch_latest
+          # args: lookback_hours max_frames image_size
+          python -m himawari_ml.ingest.fetch_latest 12 192 256
 
-      # ✅ Upload frames as a build artifact instead of git committing
       - name: Upload frames artifact
         uses: actions/upload-artifact@v4
         with:
           name: himawari-frames
           path: data/raw
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
 
