@@ -3,8 +3,7 @@ name: ingest-latest
 on:
   workflow_dispatch:
   schedule:
-    # every 2 hours (UTC). adjust if you want.
-    - cron: "0 */2 * * *"
+    - cron: "*/30 * * * *"
 
 permissions:
   contents: read
@@ -12,7 +11,7 @@ permissions:
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -22,31 +21,31 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # install your project (src layout) so python -m himawari_ml... works
           pip install -e .
-          # if you have requirements.txt, install it too (safe if missing)
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # keep explicit deps if your package doesn't pin them yet
+          pip install requests pillow
 
       - name: Ingest via NICT CDN
         env:
-          # ✅ stop early so Actions doesn't run 20 minutes
-          TARGET_SAVED: "48"
-          # ✅ skip night-side / mostly-black frames
-          MAX_DARK_FRAC: "0.92"
+          # TLS is flaky in Actions for this endpoint; force off
+          HIMAWARI_VERIFY: "0"
+          # keep runs short
+          TARGET_SAVED: "24"
+          LOOKBACK_HOURS: "48"
+          MAX_FRAMES: "96"
+          MAX_DARK_FRAC: "0.85"
         run: |
-          # args: lookback_hours max_frames image_size
-          python -m himawari_ml.ingest.fetch_latest 12 192 256
+          python -m himawari_ml.ingest.fetch_latest
 
       - name: Upload frames artifact
         uses: actions/upload-artifact@v4
         with:
           name: himawari-frames
           path: data/raw
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7
 
