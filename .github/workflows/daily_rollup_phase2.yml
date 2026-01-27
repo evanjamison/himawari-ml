@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       day:
-        description: "YYYY-MM-DD (optional). If blank: use yesterday if present else latest day under data/raw"
+        description: "Optional day (YYYY-MM-DD or YYYYMMDD). If blank: yesterday UTC if present, else latest day found."
         required: false
         default: ""
 
@@ -20,119 +20,194 @@ concurrency:
 jobs:
   rollup:
     runs-on: ubuntu-latest
+
     steps:
-      # 1) IMPORTANT: checkout DATA branch first so data/raw exists on the runner
-      - name: Checkout data branch (contains data/raw)
+      # 1) Checkout DATA branch (raw imagery lives here)
+      - name: Checkout data branch
         uses: actions/checkout@v4
         with:
           ref: data
           fetch-depth: 0
 
-      # 2) Sync code from main into data (so scripts/ are up-to-date)
-      - name: Fetch + merge main into data
+      # 2) Set git identity (required for merge commits on runner)
+      - name: Configure git identity
+        shell: bash
         run: |
-          git fetch origin main
-          git merge origin/main --no-edit || true
+          set -euo pipefail
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
 
+      # 3) Merge main -> data (fail hard on conflicts)
+      - name: Merge main into data (fail on conflicts)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if ! git merge origin/main --no-edit; then
+            echo "ERROR: merge conflict main -> data"
+            git status --porcelain
+            git diff --name-only --diff-filter=U || true
+            exit 1
+          fi
+
+      # 4) Python setup
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps (including local package)
+      - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -e .
 
-      # 3) Robust DAY resolution: input > yesterday(if exists) > latest folder under data/raw
+      # 5) Resolve DAY + input roots (robust)
       - name: Resolve DAY + input roots
         id: resolve
         shell: bash
         run: |
           set -euo pipefail
 
+          RAWROOT="data/raw"
           INPUT_DAY="${{ github.event.inputs.day }}"
-          if [[ -n "${INPUT_DAY}" ]]; then
-            DAY="${INPUT_DAY}"
+
+          norm_day() {
+            local d="$1"
+            if [[ "$d" =~ ^[0-9]{8}$ ]]; then
+              echo "${d:0:4}-${d:4:2}-${d:6:2}"
+            else
+              echo "$d"
+            fi
+          }
+
+          collect_days() {
+            local root="$1"
+
+            # A) data/raw/YYYY-MM-DD
+            find "$root" -maxdepth 1 -mindepth 1 -type d -printf '%f|%p\n' \
+              | awk -F'|' '$1 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ {print}'
+
+            # B) data/raw/YYYY/MM/DD
+            find "$root" -maxdepth 3 -mindepth 3 -type d -printf '%p\n' \
+              | awk '
+                  BEGIN{FS="/"}
+                  {
+                    n=split($0,a,"/");
+                    y=a[n-2]; m=a[n-1]; d=a[n];
+                    if (y ~ /^[0-9]{4}$/ && m ~ /^[0-9]{2}$/ && d ~ /^[0-9]{2}$/) {
+                      printf "%s-%s-%s|%s\n", y,m,d,$0
+                    }
+                  }'
+
+            # C) data/raw/YYYYMMDD
+            find "$root" -maxdepth 1 -mindepth 1 -type d -printf '%f|%p\n' \
+              | awk -F'|' '$1 ~ /^[0-9]{8}$/ {
+                  y=substr($1,1,4); m=substr($1,5,2); d=substr($1,7,2);
+                  printf "%s-%s-%s|%s\n", y,m,d,$2
+                }'
+          }
+
+          echo "---- data/raw ----"
+          ls -la "$RAWROOT" || true
+
+          mapfile -t CANDS < <(collect_days "$RAWROOT" | sort -t'|' -k1,1)
+
+          echo "---- discovered days ----"
+          if (( ${#CANDS[@]} > 0 )); then
+            printf '%s\n' "${CANDS[@]}" | tail -n 50
+          else
+            echo "(none)"
+          fi
+
+          if [[ -n "$INPUT_DAY" ]]; then
+            DAY="$(norm_day "$INPUT_DAY")"
+            DAYDIR="$(printf '%s\n' "${CANDS[@]}" | awk -F'|' -v d="$DAY" '$1==d {print $2}' | tail -n 1)"
+            [[ -n "$DAYDIR" ]] || { echo "ERROR: Input day not found"; exit 1; }
           else
             YDAY="$(date -u -d "yesterday" +%F)"
-            if [[ -d "data/raw/${YDAY}" ]]; then
-              DAY="${YDAY}"
+            DAYDIR="$(printf '%s\n' "${CANDS[@]}" | awk -F'|' -v d="$YDAY" '$1==d {print $2}' | tail -n 1)"
+            if [[ -n "$DAYDIR" ]]; then
+              DAY="$YDAY"
             else
-              # pick latest YYYY-MM-DD folder under data/raw
-              DAY="$(ls -1 data/raw 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort | tail -n 1 || true)"
-              if [[ -z "${DAY}" ]]; then
-                echo "ERROR: No day folders found under data/raw (expected YYYY-MM-DD)."
-                exit 1
-              fi
+              [[ "${#CANDS[@]}" -gt 0 ]] || { echo "ERROR: No day folders under data/raw"; exit 1; }
+              LAST="${CANDS[-1]}"
+              DAY="${LAST%%|*}"
+              DAYDIR="${LAST#*|}"
             fi
           fi
 
-          echo "Resolved DAY=${DAY}"
+          INSEQ="${DAYDIR}/sequences"
+          INLATEST="${DAYDIR}/latest"
 
-          INSEQ="data/raw/${DAY}/sequences"
-          INLATEST="data/raw/${DAY}/latest"
-
-          # Prefer sequences/; else fallback to latest/
-          if [[ -d "${INSEQ}" ]]; then
-            INROOT="${INSEQ}"
-          elif [[ -d "${INLATEST}" ]]; then
-            INROOT="${INLATEST}"
+          if [[ -d "$INSEQ" ]]; then
+            INROOT="$INSEQ"
+          elif [[ -d "$INLATEST" ]]; then
+            INROOT="$INLATEST"
           else
-            echo "ERROR: Neither ${INSEQ} nor ${INLATEST} exists."
-            echo "Did ingest create data/raw/${DAY}/latest ?"
+            echo "ERROR: Neither $INSEQ nor $INLATEST exists"
+            echo "---- daydir contents ----"
+            ls -la "$DAYDIR" || true
             exit 1
           fi
 
-          OUTMASTER="data/raw/${DAY}/master"
-          OUTFRAMES="data/raw/${DAY}/master/frames"
+          OUTMASTER="${DAYDIR}/master"
+          OUTFRAMES="${OUTMASTER}/frames"
           OUTDIR="out/${DAY}/daily"
 
-          echo "day=${DAY}" >> "$GITHUB_OUTPUT"
-          echo "inroot=${INROOT}" >> "$GITHUB_OUTPUT"
-          echo "outmaster=${OUTMASTER}" >> "$GITHUB_OUTPUT"
-          echo "outframes=${OUTFRAMES}" >> "$GITHUB_OUTPUT"
-          echo "outdir=${OUTDIR}" >> "$GITHUB_OUTPUT"
+          echo "day=$DAY" >> "$GITHUB_OUTPUT"
+          echo "daydir=$DAYDIR" >> "$GITHUB_OUTPUT"
+          echo "inroot=$INROOT" >> "$GITHUB_OUTPUT"
+          echo "outmaster=$OUTMASTER" >> "$GITHUB_OUTPUT"
+          echo "outframes=$OUTFRAMES" >> "$GITHUB_OUTPUT"
+          echo "outdir=$OUTDIR" >> "$GITHUB_OUTPUT"
 
-      # 4) Stage frames into master/frames (copy + recursive)
-      - name: Stage sequences -> daily master
+      # 6) Debug snapshot
+      - name: Debug resolved paths
+        shell: bash
         run: |
           set -euo pipefail
-          INROOT="${{ steps.resolve.outputs.inroot }}"
-          OUTMASTER="${{ steps.resolve.outputs.outmaster }}"
-          mkdir -p "${OUTMASTER}"
+          echo "DAY=${{ steps.resolve.outputs.day }}"
+          echo "DAYDIR=${{ steps.resolve.outputs.daydir }}"
+          echo "INROOT=${{ steps.resolve.outputs.inroot }}"
+          echo "OUTMASTER=${{ steps.resolve.outputs.outmaster }}"
+          echo "OUTFRAMES=${{ steps.resolve.outputs.outframes }}"
+          echo "OUTDIR=${{ steps.resolve.outputs.outdir }}"
+          find "${{ steps.resolve.outputs.daydir }}" -maxdepth 2 -type d || true
+          ls -la scripts/pipeline || true
 
+      # 7) Stage frames
+      - name: Stage frames
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ steps.resolve.outputs.outmaster }}"
           python scripts/pipeline/stage_frames.py \
-            --inputs "${INROOT}" \
-            --outdir "${OUTMASTER}" \
+            --inputs "${{ steps.resolve.outputs.inroot }}" \
+            --outdir "${{ steps.resolve.outputs.outmaster }}" \
             --recursive \
             --mode copy
 
-          test -d "${{ steps.resolve.outputs.outframes }}" || (echo "ERROR: Missing frames dir after staging" && exit 1)
-
-      # 5) Run Phase 2 on master frames
-      - name: Run Phase 2 on daily master
+      # 8) Run Phase 2
+      - name: Run Phase 2
+        shell: bash
         run: |
           set -euo pipefail
-          RAWDIR="${{ steps.resolve.outputs.outframes }}"
-          OUTDIR="${{ steps.resolve.outputs.outdir }}"
-          mkdir -p "${OUTDIR}"
-
+          mkdir -p "${{ steps.resolve.outputs.outdir }}"
           python scripts/pipeline/run_sample_pipeline.py \
-            --raw-dir "${RAWDIR}" \
-            --outdir "${OUTDIR}" \
+            --raw-dir "${{ steps.resolve.outputs.outframes }}" \
+            --outdir "${{ steps.resolve.outputs.outdir }}" \
             --save-overlays
 
-      # 6) Commit results back to data branch
-      - name: Commit daily master + outputs to data branch
+      # 9) Commit results back to data branch
+      - name: Commit results
+        shell: bash
         run: |
           set -euo pipefail
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
-
           git add -f data/raw out || true
-          git commit -m "rollup+phase2(daily): ${{ steps.resolve.outputs.day }} @ $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No changes"
+          git commit -m "daily rollup + phase2: ${{ steps.resolve.outputs.day }}" || echo "No changes"
           git push origin data
 
 
