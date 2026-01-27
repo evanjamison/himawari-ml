@@ -41,33 +41,50 @@ build/
 
 # ----------------------------
 # Project data + generated outputs
-# (THIS is the important part for your repo)
 # ----------------------------
 
-# Raw/processed data buckets
-data/raw/
+# ---- RAW DATA (tracked for CI on data branch) ----
+# Ignore everything under data/raw by default...
+data/raw/*
+
+# ...but keep day folders like data/raw/2026-01-27/ and ALL their contents
+!data/raw/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+!data/raw/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/**
+
+# Keep optional historical/testing folder if you use it
+!data/raw/sequence/
+!data/raw/sequence/**
+
+# Keep placeholder so folder structure can exist even when empty
+!data/raw/.gitkeep
+
+# ---- OTHER DATA BUCKETS (still ignored) ----
 data/interim/
 data/processed/
-
-# Your repo specifically has these (from git status)
-data/sample/raw/
-data/sample/derived/
 data/derived/
+data/sample/derived/
 
-# Model outputs / artifacts (your repo uses out/)
+# NOTE:
+# We do NOT ignore data/sample/raw/ because you often want sample images committed for tests/demos.
+
+# ---- Outputs / artifacts (ignored) ----
 out/
 outputs/
+
+# If you DO want to keep some outputs, remove the out/ and outputs/ lines above,
+# and instead ignore only heavy image artifacts under them:
+out/**/*.png
+out/**/*.jpg
+out/**/*.jpeg
+outputs/**/*.png
+outputs/**/*.jpg
+outputs/**/*.jpeg
 
 # Model checkpoints
 *.pt
 *.pth
 *.onnx
 
-# Common large image artifacts
-*.png
-*.jpg
-*.jpeg
-
-# Optional: if you ever store videos/gifs
+# Optional: videos/gifs
 *.mp4
 *.gif
