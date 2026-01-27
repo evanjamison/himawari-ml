@@ -2,15 +2,18 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
-  build-and-train-smoke:
+  smoke:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -21,13 +24,20 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # If you have a pyproject, this makes 'src/himawari_ml' importable in CI
+          if [ -f pyproject.toml ]; then pip install -e .; fi
+
+      - name: Create output dirs
+        run: |
+          mkdir -p data/derived
+          mkdir -p out/ci_models
 
       # -----------------------------
-      # Build dataset (sample mode)
+      # Build dataset (CI sample mode)
       # -----------------------------
       - name: Build dataset (CSV-only, sample)
         run: |
-          python -m scripts.build_dataset \
+          python -m scripts.experiments.segmentation.build_dataset \
             --sample \
             --limit 5 \
             --out data/derived/ci_samples.csv
@@ -40,11 +50,11 @@ jobs:
           if-no-files-found: error
 
       # -----------------------------
-      # Train baseline model
+      # Train baseline model (CI smoke)
       # -----------------------------
       - name: Train baseline (KMeans)
         run: |
-          python -m scripts.train_baseline \
+          python -m scripts.experiments.clustering.train_baseline \
             --in data/derived/ci_samples.csv \
             --outdir out/ci_models \
             --k 2
