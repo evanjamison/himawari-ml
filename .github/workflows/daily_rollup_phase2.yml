@@ -35,44 +35,71 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (including project package)
+      - name: Install deps (including local package)
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -e .
 
-      - name: Stage day -> daily master (yesterday UTC)
+      - name: Resolve DAY + input root
+        shell: bash
         run: |
-          DAY=$(date -u -d "yesterday" +%F)
+          set -euo pipefail
 
+          # Prefer "yesterday UTC", but if that folder doesn't exist, fall back to latest available day folder.
+          DAY_CANDIDATE="$(date -u -d "yesterday" +%F)"
+          if [ -d "data/raw/${DAY_CANDIDATE}" ]; then
+            DAY="${DAY_CANDIDATE}"
+          else
+            DAY="$(ls -1 data/raw 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort | tail -n 1 || true)"
+          fi
+
+          if [ -z "${DAY}" ] || [ ! -d "data/raw/${DAY}" ]; then
+            echo "ERROR: No day folders found under data/raw (expected YYYY-MM-DD)."
+            exit 1
+          fi
+
+          # Support either structure:
+          #   data/raw/DAY/sequences/...   (production)
+          #   data/raw/DAY/latest/...      (ingest_latest style)
+          if [ -d "data/raw/${DAY}/sequences" ]; then
+            INROOT="data/raw/${DAY}/sequences"
+          elif [ -d "data/raw/${DAY}/latest" ]; then
+            INROOT="data/raw/${DAY}/latest"
+          else
+            echo "ERROR: Missing inputs. Expected data/raw/${DAY}/sequences OR data/raw/${DAY}/latest"
+            ls -la "data/raw/${DAY}" || true
+            exit 1
+          fi
+
+          echo "DAY=${DAY}" >> "$GITHUB_ENV"
+          echo "INROOT=${INROOT}" >> "$GITHUB_ENV"
+          echo "Using DAY=${DAY}"
+          echo "Using INROOT=${INROOT}"
+
+      - name: Stage sequences -> daily master
+        run: |
           OUTMASTER="data/raw/${DAY}/master"
           mkdir -p "${OUTMASTER}"
 
-          # Stage from:
-          #  - current production: data/raw/DAY/latest
-          #  - optional: data/raw/DAY/sequences (if you ever add it)
-          #  - optional legacy: data/raw/DAY/*.png
           python scripts/pipeline/stage_frames.py \
-            --inputs "data/raw/${DAY}/latest" \
-                     "data/raw/${DAY}/sequences" \
-                     "data/raw/${DAY}/*.png" \
+            --inputs "${INROOT}" \
             --outdir "${OUTMASTER}" \
             --recursive \
             --mode copy
 
-      - name: Run Phase 2 on daily master (yesterday UTC)
+      - name: Run Phase 2 on daily master
         run: |
-          DAY=$(date -u -d "yesterday" +%F)
           RAWDIR="data/raw/${DAY}/master/frames"
-          # if staging produced nothing, fail with a clear message
-          if [ ! -d "${RAWDIR}" ]; then
-            echo "ERROR: missing frames dir: ${RAWDIR}"
-            echo "Did ingest create data/raw/${DAY}/latest ?"
-            exit 1
-          fi
-
           OUTDIR="out/${DAY}/daily"
           mkdir -p "${OUTDIR}"
+
+          if [ ! -d "${RAWDIR}" ]; then
+            echo "ERROR: missing frames dir: ${RAWDIR}"
+            echo "Did stage_frames.py create master/frames?"
+            find "data/raw/${DAY}/master" -maxdepth 3 -type d -print || true
+            exit 1
+          fi
 
           python scripts/pipeline/run_sample_pipeline.py \
             --raw-dir "${RAWDIR}" \
@@ -84,6 +111,7 @@ jobs:
           git config user.email "github-actions@users.noreply.github.com"
 
           git add -f data/raw out || true
-          git commit -m "rollup+phase2(daily): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No changes"
+          git commit -m "rollup+phase2(daily): ${DAY} $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No changes"
           git push origin data
+
 
