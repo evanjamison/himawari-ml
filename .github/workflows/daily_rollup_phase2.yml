@@ -35,21 +35,27 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (including local package)
+      - name: Install deps (including project package)
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -e .
 
-      - name: Stage sequences -> daily master (yesterday UTC)
+      - name: Stage day -> daily master (yesterday UTC)
         run: |
           DAY=$(date -u -d "yesterday" +%F)
-          INROOT="data/raw/${DAY}/sequences"
+
           OUTMASTER="data/raw/${DAY}/master"
           mkdir -p "${OUTMASTER}"
 
+          # Stage from:
+          #  - current production: data/raw/DAY/latest
+          #  - optional: data/raw/DAY/sequences (if you ever add it)
+          #  - optional legacy: data/raw/DAY/*.png
           python scripts/pipeline/stage_frames.py \
-            --inputs "${INROOT}" \
+            --inputs "data/raw/${DAY}/latest" \
+                     "data/raw/${DAY}/sequences" \
+                     "data/raw/${DAY}/*.png" \
             --outdir "${OUTMASTER}" \
             --recursive \
             --mode copy
@@ -58,6 +64,13 @@ jobs:
         run: |
           DAY=$(date -u -d "yesterday" +%F)
           RAWDIR="data/raw/${DAY}/master/frames"
+          # if staging produced nothing, fail with a clear message
+          if [ ! -d "${RAWDIR}" ]; then
+            echo "ERROR: missing frames dir: ${RAWDIR}"
+            echo "Did ingest create data/raw/${DAY}/latest ?"
+            exit 1
+          fi
+
           OUTDIR="out/${DAY}/daily"
           mkdir -p "${OUTDIR}"
 
@@ -73,3 +86,4 @@ jobs:
           git add -f data/raw out || true
           git commit -m "rollup+phase2(daily): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No changes"
           git push origin data
+
