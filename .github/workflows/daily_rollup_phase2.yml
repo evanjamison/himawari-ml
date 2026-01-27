@@ -2,11 +2,11 @@ name: daily-rollup-phase2
 
 on:
   schedule:
-    - cron: "10 9 * * *" # 09:10 UTC buffer
+    - cron: "10 9 * * *"
   workflow_dispatch:
     inputs:
       day:
-        description: "Optional day (YYYY-MM-DD or YYYYMMDD). If blank: yesterday UTC if present, else latest day found."
+        description: "Optional day (YYYY-MM-DD or YYYYMMDD). Leave blank to auto-detect."
         required: false
         default: ""
 
@@ -22,33 +22,22 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ------------------------------------------------------------
-      # 1) Checkout DATA branch (raw imagery lives here)
-      # ------------------------------------------------------------
+      # 1) Checkout DATA branch (raw imagery + where we commit outputs)
       - name: Checkout data branch
         uses: actions/checkout@v4
         with:
           ref: data
           fetch-depth: 0
 
-      # ------------------------------------------------------------
-      # 2) Merge main -> data (fail hard on conflicts)
-      # ------------------------------------------------------------
-      - name: Merge main into data (fail on conflicts)
+      # 2) Configure git identity (only needed for committing outputs)
+      - name: Configure git identity
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin main
-          if ! git merge origin/main --no-edit; then
-            echo "ERROR: merge conflict main -> data"
-            git status --porcelain
-            git diff --name-only --diff-filter=U || true
-            exit 1
-          fi
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@users.noreply.github.com"
 
-      # ------------------------------------------------------------
       # 3) Python setup
-      # ------------------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -62,9 +51,7 @@ jobs:
           pip install -r requirements.txt
           pip install -e .
 
-      # ------------------------------------------------------------
-      # 4) Resolve DAY + input roots (robust)
-      # ------------------------------------------------------------
+      # 4) Resolve DAY + input roots
       - name: Resolve DAY + input roots
         id: resolve
         shell: bash
@@ -75,81 +62,44 @@ jobs:
           INPUT_DAY="${{ github.event.inputs.day }}"
 
           norm_day() {
-            local d="$1"
-            if [[ "$d" =~ ^[0-9]{8}$ ]]; then
-              echo "${d:0:4}-${d:4:2}-${d:6:2}"
-            else
-              echo "$d"
-            fi
+            [[ "$1" =~ ^[0-9]{8}$ ]] && echo "${1:0:4}-${1:4:2}-${1:6:2}" || echo "$1"
           }
 
-          collect_days() {
-            local root="$1"
+          [[ -d "$RAWROOT" ]] || { echo "ERROR: $RAWROOT missing on data branch"; exit 1; }
 
-            # A) data/raw/YYYY-MM-DD
-            find "$root" -maxdepth 1 -mindepth 1 -type d -printf '%f|%p\n' \
-              | awk -F'|' '$1 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ {print}'
+          mapfile -t DAYS < <(find "$RAWROOT" -maxdepth 1 -mindepth 1 -type d -name "????-??-??" -printf "%f|%p\n" | sort)
 
-            # B) data/raw/YYYY/MM/DD
-            find "$root" -maxdepth 3 -mindepth 3 -type d -printf '%p\n' \
-              | awk -v root="$root" '
-                  BEGIN{FS="/"}
-                  {
-                    n=split($0,a,"/");
-                    y=a[n-2]; m=a[n-1]; d=a[n];
-                    if (y ~ /^[0-9]{4}$/ && m ~ /^[0-9]{2}$/ && d ~ /^[0-9]{2}$/) {
-                      printf "%s-%s-%s|%s\n", y,m,d,$0
-                    }
-                  }'
-
-            # C) data/raw/YYYYMMDD
-            find "$root" -maxdepth 1 -mindepth 1 -type d -printf '%f|%p\n' \
-              | awk -F'|' '$1 ~ /^[0-9]{8}$/ {
-                  y=substr($1,1,4); m=substr($1,5,2); d=substr($1,7,2);
-                  printf "%s-%s-%s|%s\n", y,m,d,$2
-                }'
-          }
-
-          mapfile -t CANDS < <(collect_days "$RAWROOT" | sort -t'|' -k1,1)
-
-          echo "---- data/raw ----"
-          ls -la "$RAWROOT" || true
-          echo "---- discovered days ----"
-          printf '%s\n' "${CANDS[@]}" || true
+          if [[ ${#DAYS[@]} -eq 0 ]]; then
+            echo "ERROR: No YYYY-MM-DD folders under $RAWROOT"
+            echo "---- $RAWROOT listing ----"
+            ls -la "$RAWROOT" || true
+            exit 1
+          fi
 
           if [[ -n "$INPUT_DAY" ]]; then
             DAY="$(norm_day "$INPUT_DAY")"
-            DAYDIR="$(printf '%s\n' "${CANDS[@]}" | awk -F'|' -v d="$DAY" '$1==d {print $2}' | tail -n 1)"
-            [[ -n "$DAYDIR" ]] || { echo "ERROR: Input day not found"; exit 1; }
+            DAYDIR="$(printf '%s\n' "${DAYS[@]}" | awk -F'|' -v d="$DAY" '$1==d {print $2}' | tail -n 1)"
+            [[ -n "$DAYDIR" ]] || { echo "ERROR: day '$DAY' not found under $RAWROOT"; exit 1; }
           else
-            YDAY="$(date -u -d "yesterday" +%F)"
-            DAYDIR="$(printf '%s\n' "${CANDS[@]}" | awk -F'|' -v d="$YDAY" '$1==d {print $2}' | tail -n 1)"
-            if [[ -n "$DAYDIR" ]]; then
-              DAY="$YDAY"
-            else
-              [[ "${#CANDS[@]}" -gt 0 ]] || { echo "ERROR: No day folders under data/raw"; exit 1; }
-              LAST="${CANDS[-1]}"
-              DAY="${LAST%%|*}"
-              DAYDIR="${LAST#*|}"
-            fi
+            LAST="${DAYS[-1]}"
+            DAY="${LAST%%|*}"
+            DAYDIR="${LAST#*|}"
           fi
 
-          INSEQ="${DAYDIR}/sequences"
-          INLATEST="${DAYDIR}/latest"
-
-          if [[ -d "$INSEQ" ]]; then
-            INROOT="$INSEQ"
-          elif [[ -d "$INLATEST" ]]; then
-            INROOT="$INLATEST"
+          if [[ -d "$DAYDIR/latest" ]]; then
+            INROOT="$DAYDIR/latest"
+          elif [[ -d "$DAYDIR/sequences" ]]; then
+            INROOT="$DAYDIR/sequences"
           else
-            echo "ERROR: Neither $INSEQ nor $INLATEST exists"
+            echo "ERROR: Neither latest/ nor sequences/ exists in $DAYDIR"
+            echo "---- $DAYDIR contents ----"
             ls -la "$DAYDIR" || true
             exit 1
           fi
 
-          OUTMASTER="${DAYDIR}/master"
-          OUTFRAMES="${OUTMASTER}/frames"
-          OUTDIR="out/${DAY}/daily"
+          OUTMASTER="$DAYDIR/master"
+          OUTFRAMES="$OUTMASTER/frames"
+          OUTDIR="out/$DAY/daily"
 
           echo "day=$DAY" >> "$GITHUB_OUTPUT"
           echo "daydir=$DAYDIR" >> "$GITHUB_OUTPUT"
@@ -158,9 +108,7 @@ jobs:
           echo "outframes=$OUTFRAMES" >> "$GITHUB_OUTPUT"
           echo "outdir=$OUTDIR" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------
-      # 5) DEBUG SNAPSHOT (this was the YAML error before — now fixed)
-      # ------------------------------------------------------------
+      # 5) Debug (helpful but short)
       - name: Debug resolved paths
         shell: bash
         run: |
@@ -168,16 +116,9 @@ jobs:
           echo "DAY=${{ steps.resolve.outputs.day }}"
           echo "DAYDIR=${{ steps.resolve.outputs.daydir }}"
           echo "INROOT=${{ steps.resolve.outputs.inroot }}"
-          echo "OUTMASTER=${{ steps.resolve.outputs.outmaster }}"
-          echo "OUTFRAMES=${{ steps.resolve.outputs.outframes }}"
-          echo "OUTDIR=${{ steps.resolve.outputs.outdir }}"
+          ls -la "${{ steps.resolve.outputs.inroot }}" | head -n 50 || true
 
-          find "${{ steps.resolve.outputs.daydir }}" -maxdepth 2 -type d || true
-          ls -la scripts/pipeline || true
-
-      # ------------------------------------------------------------
       # 6) Stage frames
-      # ------------------------------------------------------------
       - name: Stage frames
         shell: bash
         run: |
@@ -189,9 +130,7 @@ jobs:
             --recursive \
             --mode copy
 
-      # ------------------------------------------------------------
       # 7) Run Phase 2
-      # ------------------------------------------------------------
       - name: Run Phase 2
         shell: bash
         run: |
@@ -202,18 +141,11 @@ jobs:
             --outdir "${{ steps.resolve.outputs.outdir }}" \
             --save-overlays
 
-      # ------------------------------------------------------------
-      # 8) Commit results back to data branch
-      # ------------------------------------------------------------
-      - name: Commit results
+      # 8) Commit outputs back to data
+      - name: Commit results to data
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
           git add -f data/raw out || true
           git commit -m "daily rollup + phase2: ${{ steps.resolve.outputs.day }}" || echo "No changes"
           git push origin data
-
-
-
