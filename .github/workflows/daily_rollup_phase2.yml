@@ -115,36 +115,41 @@ jobs:
           echo "---- INROOT listing ----"
           ls -la "${{ steps.resolve.outputs.inroot }}" | head -n 50 || true
 
-      - name: Stage frames
+      - name: Stage frames by copying inputs -> master/frames
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${{ steps.resolve.outputs.outframes }}"
 
-          python scripts/pipeline/stage_frames.py \
-            --inputs "${{ steps.resolve.outputs.inroot }}" \
-            --outdir "${{ steps.resolve.outputs.outmaster }}" \
-            --recursive \
-            --mode copy
+          INROOT="${{ steps.resolve.outputs.inroot }}"
+          OUTFRAMES="${{ steps.resolve.outputs.outframes }}"
 
-          echo "---- OUTMASTER tree (3 levels) ----"
-          find "${{ steps.resolve.outputs.outmaster }}" -maxdepth 3 -type d -print || true
+          mkdir -p "$OUTFRAMES"
 
-          echo "---- OUTFRAMES sample files ----"
-          find "${{ steps.resolve.outputs.outframes }}" -maxdepth 2 -type f | head -n 30 || true
+          echo "INROOT=$INROOT"
+          echo "OUTFRAMES=$OUTFRAMES"
+          echo "---- INROOT sample ----"
+          ls -la "$INROOT" | head -n 50 || true
 
-          # Hard fail only if there are truly no frames anywhere.
-          # Some stage scripts output files directly into OUTMASTER (not OUTMASTER/frames).
-          N_FRAMES_FRAMES="$(find "${{ steps.resolve.outputs.outframes }}" -type f 2>/dev/null | wc -l || true)"
-          N_FRAMES_MASTER="$(find "${{ steps.resolve.outputs.outmaster }}" -maxdepth 1 -type f 2>/dev/null | wc -l || true)"
+          # Copy PNGs into master/frames. Supports nested directories.
+          shopt -s globstar nullglob
+          COPIED=0
+          for f in "$INROOT"/**/*.png "$INROOT"/*.png; do
+            if [[ -f "$f" ]]; then
+              cp -f "$f" "$OUTFRAMES/"
+              COPIED=$((COPIED+1))
+            fi
+          done
 
-          echo "frames_in_frames_dir=${N_FRAMES_FRAMES}"
-          echo "frames_in_master_dir=${N_FRAMES_MASTER}"
+          echo "Copied $COPIED png files into $OUTFRAMES"
 
-          if [[ "$N_FRAMES_FRAMES" -eq 0 && "$N_FRAMES_MASTER" -eq 0 ]]; then
-            echo "ERROR: stage_frames produced no files in either OUTFRAMES or OUTMASTER."
+          if [[ "$COPIED" -eq 0 ]]; then
+            echo "ERROR: No PNG frames found under $INROOT"
             exit 1
           fi
+
+          echo "---- OUTFRAMES sample ----"
+          ls -la "$OUTFRAMES" | head -n 50 || true
+
 
       - name: Run Phase 2
         shell: bash
