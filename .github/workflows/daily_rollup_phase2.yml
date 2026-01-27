@@ -22,14 +22,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Checkout DATA branch (raw imagery + where we commit outputs)
       - name: Checkout data branch
         uses: actions/checkout@v4
         with:
           ref: data
           fetch-depth: 0
 
-      # 2) Configure git identity (only needed for committing outputs)
       - name: Configure git identity
         shell: bash
         run: |
@@ -37,7 +35,6 @@ jobs:
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@users.noreply.github.com"
 
-      # 3) Python setup
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -51,7 +48,6 @@ jobs:
           pip install -r requirements.txt
           pip install -e .
 
-      # 4) Resolve DAY + input roots
       - name: Resolve DAY + input roots
         id: resolve
         shell: bash
@@ -71,7 +67,6 @@ jobs:
 
           if [[ ${#DAYS[@]} -eq 0 ]]; then
             echo "ERROR: No YYYY-MM-DD folders under $RAWROOT"
-            echo "---- $RAWROOT listing ----"
             ls -la "$RAWROOT" || true
             exit 1
           fi
@@ -92,7 +87,6 @@ jobs:
             INROOT="$DAYDIR/sequences"
           else
             echo "ERROR: Neither latest/ nor sequences/ exists in $DAYDIR"
-            echo "---- $DAYDIR contents ----"
             ls -la "$DAYDIR" || true
             exit 1
           fi
@@ -108,7 +102,6 @@ jobs:
           echo "outframes=$OUTFRAMES" >> "$GITHUB_OUTPUT"
           echo "outdir=$OUTDIR" >> "$GITHUB_OUTPUT"
 
-      # 5) Debug (helpful but short)
       - name: Debug resolved paths
         shell: bash
         run: |
@@ -116,32 +109,63 @@ jobs:
           echo "DAY=${{ steps.resolve.outputs.day }}"
           echo "DAYDIR=${{ steps.resolve.outputs.daydir }}"
           echo "INROOT=${{ steps.resolve.outputs.inroot }}"
+          echo "OUTMASTER=${{ steps.resolve.outputs.outmaster }}"
+          echo "OUTFRAMES=${{ steps.resolve.outputs.outframes }}"
+          echo "OUTDIR=${{ steps.resolve.outputs.outdir }}"
+          echo "---- INROOT listing ----"
           ls -la "${{ steps.resolve.outputs.inroot }}" | head -n 50 || true
 
-      # 6) Stage frames
       - name: Stage frames
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${{ steps.resolve.outputs.outmaster }}"
+          mkdir -p "${{ steps.resolve.outputs.outframes }}"
+
           python scripts/pipeline/stage_frames.py \
             --inputs "${{ steps.resolve.outputs.inroot }}" \
             --outdir "${{ steps.resolve.outputs.outmaster }}" \
             --recursive \
             --mode copy
 
-      # 7) Run Phase 2
+          echo "---- OUTMASTER tree (3 levels) ----"
+          find "${{ steps.resolve.outputs.outmaster }}" -maxdepth 3 -type d -print || true
+
+          echo "---- OUTFRAMES sample files ----"
+          find "${{ steps.resolve.outputs.outframes }}" -maxdepth 2 -type f | head -n 30 || true
+
+          # Hard fail only if there are truly no frames anywhere.
+          # Some stage scripts output files directly into OUTMASTER (not OUTMASTER/frames).
+          N_FRAMES_FRAMES="$(find "${{ steps.resolve.outputs.outframes }}" -type f 2>/dev/null | wc -l || true)"
+          N_FRAMES_MASTER="$(find "${{ steps.resolve.outputs.outmaster }}" -maxdepth 1 -type f 2>/dev/null | wc -l || true)"
+
+          echo "frames_in_frames_dir=${N_FRAMES_FRAMES}"
+          echo "frames_in_master_dir=${N_FRAMES_MASTER}"
+
+          if [[ "$N_FRAMES_FRAMES" -eq 0 && "$N_FRAMES_MASTER" -eq 0 ]]; then
+            echo "ERROR: stage_frames produced no files in either OUTFRAMES or OUTMASTER."
+            exit 1
+          fi
+
       - name: Run Phase 2
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "${{ steps.resolve.outputs.outdir }}"
+
+          # Prefer OUTFRAMES if it exists + non-empty, else fall back to OUTMASTER (some stage scripts write there)
+          RAWDIR="${{ steps.resolve.outputs.outframes }}"
+          if [[ ! -d "$RAWDIR" ]] || [[ "$(find "$RAWDIR" -type f 2>/dev/null | wc -l)" -eq 0 ]]; then
+            RAWDIR="${{ steps.resolve.outputs.outmaster }}"
+          fi
+
+          echo "Using RAWDIR=$RAWDIR"
+          ls -la "$RAWDIR" | head -n 50 || true
+
           python scripts/pipeline/run_sample_pipeline.py \
-            --raw-dir "${{ steps.resolve.outputs.outframes }}" \
+            --raw-dir "$RAWDIR" \
             --outdir "${{ steps.resolve.outputs.outdir }}" \
             --save-overlays
 
-      # 8) Commit outputs back to data
       - name: Commit results to data
         shell: bash
         run: |
