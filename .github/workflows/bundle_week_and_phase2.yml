@@ -1,0 +1,79 @@
+name: bundle-week-and-phase2
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"   # Mondays 09:00 UTC (weekly rollup)
+  workflow_dispatch:
+    inputs:
+      week_label:
+        description: "Optional override label, e.g., week_2026-W04"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bundle-week-and-phase2
+  cancel-in-progress: false
+
+jobs:
+  bundle_and_run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (code)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch data branch (raw frames)
+        run: |
+          git fetch origin data:data
+
+      - name: Checkout data branch into working tree data-only
+        run: |
+          # Keep code from main, but bring in data/raw from data branch:
+          git checkout data -- data/raw
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Choose week label
+        id: wk
+        run: |
+          if [ -n "${{ inputs.week_label }}" ]; then
+            echo "label=${{ inputs.week_label }}" >> $GITHUB_OUTPUT
+          else
+            # ISO week label like 2026-W04
+            label=$(date -u +'%G-W%V')
+            echo "label=week_${label}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Stage frames into weekly bundle (sorted + manifest)
+        run: |
+          python scripts/pipeline/stage_frames.py \
+            --inputs "data/raw/**/sequence_*/himawari_*.png" \
+            --outdir "out/bundles/${{ steps.wk.outputs.label }}" \
+            --recursive \
+            --mode copy
+
+      - name: Run Phase 2 on the weekly bundle frames
+        run: |
+          python scripts/pipeline/run_phase2_sequenceA.py \
+            --raw-dir "out/bundles/${{ steps.wk.outputs.label }}/frames" \
+            --outdir "out/bundles/${{ steps.wk.outputs.label }}" \
+            --ensure-baseline
+
+      - name: Upload bundle outputs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.wk.outputs.label }}_outputs"
+          path: |
+            out/bundles/${{ steps.wk.outputs.label }}/

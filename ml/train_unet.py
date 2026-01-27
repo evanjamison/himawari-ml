@@ -19,7 +19,12 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve()
+while not (REPO_ROOT / "pyproject.toml").exists() and not (REPO_ROOT / ".git").exists():
+    if REPO_ROOT == REPO_ROOT.parent:
+        break
+    REPO_ROOT = REPO_ROOT.parent
+
 
 
 # -------------------------

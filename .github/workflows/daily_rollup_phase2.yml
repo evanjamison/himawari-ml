@@ -1,0 +1,76 @@
+name: daily-rollup-phase2
+
+on:
+  schedule:
+    - cron: "10 9 * * *"   # 09:10 UTC buffer
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-rollup-phase2
+  cancel-in-progress: false
+
+jobs:
+  rollup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (code)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch data branch
+        run: |
+          git fetch origin data || true
+
+      - name: Switch to data branch and sync code from main
+        run: |
+          git switch data || git switch -c data
+          git merge origin/main --no-edit || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Stage sequences -> daily master (yesterday UTC)
+        run: |
+          DAY=$(date -u -d "yesterday" +%F)
+          INROOT="data/raw/${DAY}/sequences"
+          OUTMASTER="data/raw/${DAY}/master"
+          mkdir -p "${OUTMASTER}"
+
+          # adjust path if your file lives elsewhere
+          python scripts/pipeline/stage_frames.py \
+            --inputs "${INROOT}" \
+            --outdir "${OUTMASTER}" \
+            --recursive \
+            --mode copy
+
+      - name: Run Phase 2 on daily master (yesterday UTC)
+        run: |
+          DAY=$(date -u -d "yesterday" +%F)
+          RAWDIR="data/raw/${DAY}/master/frames"
+          OUTDIR="out/${DAY}/daily"
+          mkdir -p "${OUTDIR}"
+
+          python scripts/pipeline/run_sample_pipeline.py \
+            --raw-dir "${RAWDIR}" \
+            --outdir "${OUTDIR}"
+
+      - name: Commit daily master + outputs to data branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+
+          git add -f data/raw out || true
+          git commit -m "rollup+phase2(daily): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No changes"
+          git push origin data
+

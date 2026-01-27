@@ -10,7 +10,28 @@ import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# -----------------------------
+# Robust repo root detection
+# -----------------------------
+def _find_repo_root(start: Path) -> Path:
+    """
+    Walk upward until we find pyproject.toml (preferred) or .git.
+    This makes scripts resilient to folder reorganizations.
+    """
+    p = start.resolve()
+    for _ in range(20):
+        if (p / "pyproject.toml").exists() or (p / ".git").exists():
+            return p
+        if p == p.parent:
+            break
+        p = p.parent
+    # fallback: 2 parents up from file (better than crashing)
+    return start.resolve().parents[2]
+
+
+REPO_ROOT = _find_repo_root(Path(__file__))
+
 
 TS_RE = re.compile(r"(\d{8})_(\d{6})Z")  # e.g. 20260122_051000Z
 
@@ -26,6 +47,7 @@ def _label_connected_components(mask: np.ndarray) -> Tuple[np.ndarray, int]:
     """
     try:
         from scipy.ndimage import label  # type: ignore
+
         labels, n = label(mask.astype(np.uint8))
         return labels.astype(np.int32), int(n)
     except Exception:
@@ -33,6 +55,7 @@ def _label_connected_components(mask: np.ndarray) -> Tuple[np.ndarray, int]:
 
     try:
         from skimage.measure import label as sk_label  # type: ignore
+
         labels = sk_label(mask.astype(np.uint8), connectivity=2)
         n = int(labels.max())
         return labels.astype(np.int32), n
@@ -45,9 +68,16 @@ def _label_connected_components(mask: np.ndarray) -> Tuple[np.ndarray, int]:
     n = 0
 
     # 8-connectivity
-    neigh = [(-1, -1), (-1, 0), (-1, 1),
-             (0, -1),           (0, 1),
-             (1, -1),  (1, 0),  (1, 1)]
+    neigh = [
+        (-1, -1),
+        (-1, 0),
+        (-1, 1),
+        (0, -1),
+        (0, 1),
+        (1, -1),
+        (1, 0),
+        (1, 1),
+    ]
 
     for y in range(H):
         for x in range(W):
@@ -60,7 +90,12 @@ def _label_connected_components(mask: np.ndarray) -> Tuple[np.ndarray, int]:
                 cy, cx = stack.pop()
                 for dy, dx in neigh:
                     ny, nx = cy + dy, cx + dx
-                    if 0 <= ny < H and 0 <= nx < W and mask[ny, nx] and labels[ny, nx] == 0:
+                    if (
+                        0 <= ny < H
+                        and 0 <= nx < W
+                        and mask[ny, nx]
+                        and labels[ny, nx] == 0
+                    ):
                         labels[ny, nx] = n
                         stack.append((ny, nx))
 
@@ -75,7 +110,9 @@ def parse_timestamp_from_name(name: str) -> pd.Timestamp | None:
     if not m:
         return None
     ymd, hms = m.group(1), m.group(2)
-    ts = pd.to_datetime(f"{ymd}{hms}", format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+    ts = pd.to_datetime(
+        f"{ymd}{hms}", format="%Y%m%d%H%M%S", errors="coerce", utc=True
+    )
     if pd.isna(ts):
         return None
     return ts
@@ -85,12 +122,39 @@ def _norm_relpath(s: pd.Series) -> pd.Series:
     return s.astype(str).str.replace("\\", "/", regex=False)
 
 
-def _load_metrics(metrics_csv: Path) -> pd.DataFrame:
+def _resolve_path(s: str, *, out_root: Path) -> Path:
+    """
+    Resolve a path string that might be:
+      - absolute
+      - repo-relative (e.g., out/masks/xxx.png)
+      - out-relative (e.g., masks/xxx.png)
+    """
+    p = Path(s)
+
+    if p.is_absolute():
+        return p
+
+    # First try repo-relative
+    cand1 = (REPO_ROOT / p).resolve()
+    if cand1.exists():
+        return cand1
+
+    # Then try outdir-relative
+    cand2 = (out_root / p).resolve()
+    if cand2.exists():
+        return cand2
+
+    # Common fallback: out/masks by filename
+    cand3 = (out_root / "masks" / p.name).resolve()
+    return cand3
+
+
+def _load_metrics(metrics_csv: Path, *, out_root: Path) -> pd.DataFrame:
     if not metrics_csv.exists():
         raise FileNotFoundError(f"metrics_csv not found: {metrics_csv}")
     df = pd.read_csv(metrics_csv)
 
-    # Normalize paths
+    # Normalize stored slashes
     for c in ["relpath", "mask_path"]:
         if c in df.columns:
             df[c] = _norm_relpath(df[c])
@@ -101,7 +165,6 @@ def _load_metrics(metrics_csv: Path) -> pd.DataFrame:
 
     # If timestamp missing, try parse from filename
     if "timestamp_utc" not in df.columns or df["timestamp_utc"].isna().all():
-        # Try from relpath basename
         def _infer_ts(rp: str):
             return parse_timestamp_from_name(Path(rp).name)
         if "relpath" in df.columns:
@@ -115,31 +178,38 @@ def _load_metrics(metrics_csv: Path) -> pd.DataFrame:
     if "mask_path" not in df.columns:
         raise ValueError("cloud_metrics.csv must contain 'mask_path' (run cloud_mask_baseline.py).")
 
-    # Keep only existing masks
-    def exists(rel: str) -> bool:
-        return (REPO_ROOT / rel).exists()
+    # Resolve mask paths robustly + keep only existing masks
+    resolved_masks: list[str] = []
+    exists_flags: list[bool] = []
 
-    df = df[df["mask_path"].map(exists)].copy()
-    df = df.reset_index(drop=True)
+    for mp in df["mask_path"].astype(str).tolist():
+        p = _resolve_path(mp, out_root=out_root)
+        resolved_masks.append(str(p))
+        exists_flags.append(p.exists())
+
+    df["mask_path"] = resolved_masks
+    df = df[pd.Series(exists_flags, index=df.index)].copy().reset_index(drop=True)
 
     if len(df) == 0:
         raise ValueError("No rows with existing mask files. Check out/cloud_metrics.csv and out/masks/.")
 
-    # Sort by time
+    # Sort by time if available
     if "timestamp_utc" in df.columns:
         df = df.sort_values(["timestamp_utc", "mask_path"], na_position="last")
 
     return df
 
 
-def _load_mask(mask_rel: str) -> np.ndarray:
-    p = REPO_ROOT / mask_rel
+def _load_mask(mask_path: str) -> np.ndarray:
+    p = Path(mask_path)
     im = Image.open(p).convert("L")
     arr = np.asarray(im, dtype=np.uint8)
     return arr > 127
 
 
-def _overlay_objects_on_rgb(rgb: Image.Image, objects: List[Dict[str, Any]], alpha: int = 120) -> Image.Image:
+def _overlay_objects_on_rgb(
+    rgb: Image.Image, objects: List[Dict[str, Any]], alpha: int = 120
+) -> Image.Image:
     """
     Draw bounding boxes + centroids on an RGB image.
     """
@@ -161,12 +231,9 @@ def _overlay_objects_on_rgb(rgb: Image.Image, objects: List[Dict[str, Any]], alp
         cx, cy = obj["centroid_xy"]
         col = colors[i % len(colors)]
 
-        # bbox
         draw.rectangle([x0, y0, x1, y1], outline=col[:3] + (255,), width=3)
-        # centroid
         r = 4
         draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=col[:3] + (255,))
-        # label
         draw.text((x0 + 4, y0 + 4), f"#{obj['object_id']}", fill=col[:3] + (255,))
 
     return base.convert("RGB")
@@ -203,8 +270,11 @@ class Params:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--metrics-csv", default=str(REPO_ROOT / "out" / "cloud_metrics.csv"),
-                    help="CSV from cloud_mask_baseline.py (default: out/cloud_metrics.csv)")
+    ap.add_argument(
+        "--metrics-csv",
+        default=str(REPO_ROOT / "out" / "cloud_metrics.csv"),
+        help="CSV from cloud_mask_baseline.py (default: out/cloud_metrics.csv)",
+    )
     ap.add_argument("--outdir", default=str(REPO_ROOT / "out"), help="Base output directory (default: out/)")
     ap.add_argument("--min-area-px", type=int, default=250, help="Minimum component area to keep (pixels)")
     ap.add_argument("--max-objects", type=int, default=5, help="Keep top-K largest objects per frame")
@@ -230,7 +300,7 @@ def main() -> int:
     if params.save_overlays:
         out_objs_dir.mkdir(parents=True, exist_ok=True)
 
-    df = _load_metrics(metrics_csv)
+    df = _load_metrics(metrics_csv, out_root=out_root)
 
     if args.max_frames and int(args.max_frames) > 0:
         df = df.tail(int(args.max_frames)).copy().reset_index(drop=True)
@@ -240,31 +310,31 @@ def main() -> int:
 
     overlays_for_sheet: List[Image.Image] = []
 
-    for i, row in df.iterrows():
-        mask_rel = row["mask_path"]
-        relpath = row["relpath"] if "relpath" in row else ""
+    for _, row in df.iterrows():
+        mask_path = str(row["mask_path"])
+        relpath = str(row["relpath"]) if "relpath" in row and pd.notna(row["relpath"]) else ""
         ts = row["timestamp_utc"] if "timestamp_utc" in row else None
 
-        mask = _load_mask(mask_rel)
+        mask = _load_mask(mask_path)
         H, W = mask.shape
         labels, n = _label_connected_components(mask)
 
-        # Compute areas
         if n == 0:
-            frame_rows.append({
-                "timestamp_utc": ts,
-                "relpath": relpath,
-                "mask_path": mask_rel,
-                "n_objects": 0,
-                "total_cloud_frac": float(mask.mean()),
-                "largest_area_px": 0,
-                "largest_area_frac": 0.0,
-                "largest_centroid_x": np.nan,
-                "largest_centroid_y": np.nan,
-            })
+            frame_rows.append(
+                {
+                    "timestamp_utc": ts,
+                    "relpath": relpath,
+                    "mask_path": mask_path,
+                    "n_objects": 0,
+                    "total_cloud_frac": float(mask.mean()),
+                    "largest_area_px": 0,
+                    "largest_area_frac": 0.0,
+                    "largest_centroid_x": np.nan,
+                    "largest_centroid_y": np.nan,
+                }
+            )
             continue
 
-        # Gather components
         comps = []
         for lab in range(1, n + 1):
             ys, xs = np.where(labels == lab)
@@ -275,80 +345,83 @@ def main() -> int:
             y0, y1 = int(ys.min()), int(ys.max())
             cx = float(xs.mean())
             cy = float(ys.mean())
-            comps.append({
-                "object_id": lab,
-                "area_px": area,
-                "area_frac": area / float(H * W),
-                "bbox": (x0, y0, x1, y1),
-                "centroid_xy": (cx, cy),
-            })
+            comps.append(
+                {
+                    "object_id": lab,
+                    "area_px": area,
+                    "area_frac": area / float(H * W),
+                    "bbox": (x0, y0, x1, y1),
+                    "centroid_xy": (cx, cy),
+                }
+            )
 
-        # Keep top-K by area
-        comps = sorted(comps, key=lambda d: d["area_px"], reverse=True)[:params.max_objects_per_frame]
+        comps = sorted(comps, key=lambda d: d["area_px"], reverse=True)[: params.max_objects_per_frame]
 
-        # Per-object rows
         for rank, obj in enumerate(comps, start=1):
-            object_rows.append({
-                "timestamp_utc": ts,
-                "relpath": relpath,
-                "mask_path": mask_rel,
-                "object_rank": rank,
-                "object_id": obj["object_id"],
-                "area_px": obj["area_px"],
-                "area_frac": obj["area_frac"],
-                "bbox_x0": obj["bbox"][0],
-                "bbox_y0": obj["bbox"][1],
-                "bbox_x1": obj["bbox"][2],
-                "bbox_y1": obj["bbox"][3],
-                "centroid_x": obj["centroid_xy"][0],
-                "centroid_y": obj["centroid_xy"][1],
-            })
+            object_rows.append(
+                {
+                    "timestamp_utc": ts,
+                    "relpath": relpath,
+                    "mask_path": mask_path,
+                    "object_rank": rank,
+                    "object_id": obj["object_id"],
+                    "area_px": obj["area_px"],
+                    "area_frac": obj["area_frac"],
+                    "bbox_x0": obj["bbox"][0],
+                    "bbox_y0": obj["bbox"][1],
+                    "bbox_x1": obj["bbox"][2],
+                    "bbox_y1": obj["bbox"][3],
+                    "centroid_x": obj["centroid_xy"][0],
+                    "centroid_y": obj["centroid_xy"][1],
+                }
+            )
 
-        # Per-frame summary
         if comps:
             largest = comps[0]
-            frame_rows.append({
-                "timestamp_utc": ts,
-                "relpath": relpath,
-                "mask_path": mask_rel,
-                "n_objects": len(comps),
-                "total_cloud_frac": float(mask.mean()),
-                "largest_area_px": int(largest["area_px"]),
-                "largest_area_frac": float(largest["area_frac"]),
-                "largest_centroid_x": float(largest["centroid_xy"][0]),
-                "largest_centroid_y": float(largest["centroid_xy"][1]),
-            })
+            frame_rows.append(
+                {
+                    "timestamp_utc": ts,
+                    "relpath": relpath,
+                    "mask_path": mask_path,
+                    "n_objects": len(comps),
+                    "total_cloud_frac": float(mask.mean()),
+                    "largest_area_px": int(largest["area_px"]),
+                    "largest_area_frac": float(largest["area_frac"]),
+                    "largest_centroid_x": float(largest["centroid_xy"][0]),
+                    "largest_centroid_y": float(largest["centroid_xy"][1]),
+                }
+            )
         else:
-            frame_rows.append({
-                "timestamp_utc": ts,
-                "relpath": relpath,
-                "mask_path": mask_rel,
-                "n_objects": 0,
-                "total_cloud_frac": float(mask.mean()),
-                "largest_area_px": 0,
-                "largest_area_frac": 0.0,
-                "largest_centroid_x": np.nan,
-                "largest_centroid_y": np.nan,
-            })
+            frame_rows.append(
+                {
+                    "timestamp_utc": ts,
+                    "relpath": relpath,
+                    "mask_path": mask_path,
+                    "n_objects": 0,
+                    "total_cloud_frac": float(mask.mean()),
+                    "largest_area_px": 0,
+                    "largest_area_frac": 0.0,
+                    "largest_centroid_x": np.nan,
+                    "largest_centroid_y": np.nan,
+                }
+            )
 
         # Optional overlay on the RGB image (if relpath exists)
-        if params.save_overlays and relpath and (REPO_ROOT / relpath).exists():
-            rgb = Image.open(REPO_ROOT / relpath).convert("RGB")
-            # Make sure overlay matches mask size if needed (rare, but safe)
-            if rgb.size != (W, H):
-                rgb = rgb.resize((W, H), resample=Image.Resampling.BILINEAR)
+        if params.save_overlays and relpath:
+            rgb_path = _resolve_path(relpath, out_root=out_root)
+            if rgb_path.exists():
+                rgb = Image.open(rgb_path).convert("RGB")
+                if rgb.size != (W, H):
+                    rgb = rgb.resize((W, H), resample=Image.Resampling.BILINEAR)
 
-            ov = _overlay_objects_on_rgb(rgb, comps, alpha=params.overlay_alpha)
-            out_overlay = out_objs_dir / (Path(relpath).stem + "_objects.png")
-            ov.save(out_overlay)
+                ov = _overlay_objects_on_rgb(rgb, comps, alpha=params.overlay_alpha)
+                out_overlay = out_objs_dir / (Path(relpath).stem + "_objects.png")
+                ov.save(out_overlay)
+                overlays_for_sheet.append(ov)
 
-            overlays_for_sheet.append(ov)
-
-    # Write CSVs
     objs_df = pd.DataFrame(object_rows)
     frames_df = pd.DataFrame(frame_rows)
 
-    # Normalize timestamp dtype
     if "timestamp_utc" in frames_df.columns:
         frames_df["timestamp_utc"] = pd.to_datetime(frames_df["timestamp_utc"], errors="coerce", utc=True)
         frames_df = frames_df.sort_values(["timestamp_utc", "mask_path"], na_position="last")
@@ -362,7 +435,6 @@ def main() -> int:
     objs_df.to_csv(out_objects_csv, index=False)
     frames_df.to_csv(out_frames_csv, index=False)
 
-    # Contact sheet
     sheet_png = None
     if params.save_overlays and overlays_for_sheet:
         n = min(params.contact_sheet_n, len(overlays_for_sheet))

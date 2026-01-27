@@ -1,0 +1,83 @@
+name: ingest-burst
+
+on:
+  workflow_dispatch:
+    inputs:
+      sequence:
+        description: "Sequence label (e.g., burst_01)"
+        required: true
+        default: "burst_01"
+      hours:
+        description: "How many hours back to fetch"
+        required: true
+        default: "12"
+      step_minutes:
+        description: "Minutes between frames"
+        required: true
+        default: "10"
+      frames:
+        description: "Optional: override exact frame count (leave blank to compute from hours/step)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ingest-burst
+  cancel-in-progress: false
+
+jobs:
+  burst:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (code)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compute frames (if not provided)
+        id: calc
+        run: |
+          if [ -n "${{ inputs.frames }}" ]; then
+            echo "frames=${{ inputs.frames }}" >> $GITHUB_OUTPUT
+          else
+            hours=${{ inputs.hours }}
+            step=${{ inputs.step_minutes }}
+            frames=$(( (hours*60) / step ))
+            echo "frames=$frames" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch burst sequence
+        run: |
+          python scripts/pipeline/fetch_sequence.py \
+            --sequence "${{ inputs.sequence }}" \
+            --frames "${{ steps.calc.outputs.frames }}" \
+            --step-minutes "${{ inputs.step_minutes }}"
+
+      - name: Commit burst data to data branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+
+          git checkout data || git checkout -b data
+          git add -f data/raw || true
+
+          if git diff --cached --quiet; then
+            echo "No new frames to commit."
+            exit 0
+          fi
+
+          git commit -m "ingest: burst ${{ inputs.sequence }} ($(date -u +'%Y-%m-%dT%H:%M:%SZ'))"
+          git push origin data
+

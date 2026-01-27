@@ -34,8 +34,12 @@ HEADERS = {"User-Agent": "himawari-ml/1.0 (research; GitHub Actions)"}
 
 # ---- Actions-friendly limits (override via env) ----
 TARGET_SAVED = int(os.getenv("TARGET_SAVED", "24" if IN_GHA else "48"))
-MAX_FRAMES_DEFAULT = int(os.getenv("MAX_FRAMES", "96" if IN_GHA else "192"))
-LOOKBACK_HOURS_DEFAULT = int(os.getenv("LOOKBACK_HOURS", "48" if IN_GHA else "72"))
+MAX_FRAMES_DEFAULT = int(os.getenv("MAX_FRAMES", "288" if IN_GHA else "576"))  # 48–96 hours of candidates
+LOOKBACK_HOURS_DEFAULT = int(os.getenv("LOOKBACK_HOURS", "72" if IN_GHA else "96"))
+
+# Start a bit behind "now" because NICT tiles lag real time.
+# (Most common reason for "tile missing/corrupt" on newest timestamps.)
+START_DELAY_MINUTES = int(os.getenv("START_DELAY_MINUTES", "40" if IN_GHA else "20"))
 
 # Image size expected by your ML (keep 256 by default)
 DEFAULT_IMAGE_SIZE = int(os.getenv("IMAGE_SIZE", "256"))
@@ -68,7 +72,7 @@ PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
 def _is_valid_png_bytes(b: bytes, min_bytes: int = 8000) -> bool:
-    if b is None:
+    if not b:
         return False
     if len(b) < min_bytes:
         return False
@@ -84,6 +88,10 @@ def _session() -> requests.Session:
 
 
 def _get(s: requests.Session, url: str, cfg: FetchCfg) -> bytes | None:
+    """
+    Return PNG bytes or None if missing/unavailable.
+    Important: newest timestamps often return 404 (not published yet).
+    """
     last_err: Exception | None = None
     for i in range(cfg.retries):
         try:
@@ -91,7 +99,6 @@ def _get(s: requests.Session, url: str, cfg: FetchCfg) -> bytes | None:
             if r.status_code == 404:
                 return None
             r.raise_for_status()
-
             b = r.content
             if not _is_valid_png_bytes(b):
                 return None
@@ -99,15 +106,14 @@ def _get(s: requests.Session, url: str, cfg: FetchCfg) -> bytes | None:
         except Exception as e:
             last_err = e
             if i == cfg.retries - 1:
-                log.warning(f"Fetch failed: {url} -> {e}")
+                log.debug(f"Fetch failed: {url} -> {e}")
             time.sleep(cfg.backoff_base_s * (2**i))
-    if last_err:
-        return None
+    _ = last_err
     return None
 
 
-def latest_timestamp_10min() -> datetime:
-    now = datetime.now(timezone.utc)
+def latest_timestamp_10min(delay_minutes: int = 0) -> datetime:
+    now = datetime.now(timezone.utc) - timedelta(minutes=delay_minutes)
     minute = (now.minute // 10) * 10
     return now.replace(minute=minute, second=0, microsecond=0)
 
@@ -150,24 +156,37 @@ def fetch_frame(ts: datetime, out_dir: Path, image_size: int, cfg: FetchCfg) -> 
     rel_prefix = f"D531106/{LEVEL}d/{TILE_SIZE}/{y}/{m}/{d}/{hms}"
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / frame_filename(ts)  # ✅ full UTC timestamp filename
+    out_path = out_dir / frame_filename(ts)
 
     s = _session()
 
     for base in BASES:
-        try:
-            tiles: list[list[Image.Image]] = []
-            for ty in range(LEVEL):
-                row: list[Image.Image] = []
-                for tx in range(LEVEL):
-                    url = f"{base}/{rel_prefix}_{tx}_{ty}.png"
-                    b = _get(s, url, cfg)
-                    if b is None:
-                        raise RuntimeError(f"tile missing/corrupt ({tx},{ty})")
+        # Try to build full disk. If ANY tile missing, treat timestamp as unavailable.
+        tiles: list[list[Image.Image]] = []
+        ok = True
+        for ty in range(LEVEL):
+            row: list[Image.Image] = []
+            for tx in range(LEVEL):
+                url = f"{base}/{rel_prefix}_{tx}_{ty}.png"
+                b = _get(s, url, cfg)
+                if b is None:
+                    ok = False
+                    break
+                try:
                     im = Image.open(BytesIO(b)).convert("RGB")
-                    row.append(im)
-                tiles.append(row)
+                except Exception:
+                    ok = False
+                    break
+                row.append(im)
+            if not ok:
+                break
+            tiles.append(row)
 
+        if not ok:
+            # Don’t spam “Base failed” as if it were an exception; it’s usually just not published yet.
+            continue
+
+        try:
             full = Image.new("RGB", (LEVEL * TILE_SIZE, LEVEL * TILE_SIZE))
             for ty in range(LEVEL):
                 for tx in range(LEVEL):
@@ -184,9 +203,8 @@ def fetch_frame(ts: datetime, out_dir: Path, image_size: int, cfg: FetchCfg) -> 
             resized.save(out_path)
             log.info(f"Saved {out_path} (dark_frac_on_disk={dark_frac:.3f})")
             return True
-
         except Exception as e:
-            log.warning(f"Base failed: {base} -> {e}")
+            log.warning(f"Stitch/save failed for {out_path.name} via {base}: {e}")
 
     log.warning(f"All sources failed for {rel_prefix}_x_y.png (stitched)")
     return False
@@ -197,11 +215,9 @@ def main(
     max_frames: int = MAX_FRAMES_DEFAULT,
     image_size: int = DEFAULT_IMAGE_SIZE,
 ) -> int:
-    # ✅ Production default: data/raw/YYYY-MM-DD/latest/
-    # Optional override: HIMAWARI_OUT_DIR=/some/path
     out = Path(os.getenv("HIMAWARI_OUT_DIR", "")).expanduser() if os.getenv("HIMAWARI_OUT_DIR") else raw_latest_dir()
 
-    ts = latest_timestamp_10min()
+    ts = latest_timestamp_10min(delay_minutes=START_DELAY_MINUTES)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
 
     cfg = FetchCfg()
@@ -217,7 +233,8 @@ def main(
 
     log.info(
         f"Done. Saved {saved} frames (checked {checked}). "
-        f"out={out} verify_ssl={VERIFY_SSL} target_saved={TARGET_SAVED} max_dark_frac={MAX_DARK_FRAC}"
+        f"out={out} verify_ssl={VERIFY_SSL} "
+        f"target_saved={TARGET_SAVED} max_dark_frac={MAX_DARK_FRAC} start_delay_min={START_DELAY_MINUTES}"
     )
     return 0
 

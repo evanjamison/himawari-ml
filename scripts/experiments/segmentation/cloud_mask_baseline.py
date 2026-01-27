@@ -12,7 +12,11 @@ import matplotlib.pyplot as plt
 from PIL import Image, ImageFilter
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+# Robust repo root detection (works even if script is moved)
+REPO_ROOT = Path(__file__).resolve()
+while not (REPO_ROOT / "pyproject.toml").exists() and REPO_ROOT != REPO_ROOT.parent:
+    REPO_ROOT = REPO_ROOT.parent
+
 RAW_DIR_DEFAULT = REPO_ROOT / "data" / "raw" / "sequence"
 
 

@@ -1,0 +1,68 @@
+name: ingest-hourly
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ingest-hourly
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (code)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch data branch
+        run: |
+          git fetch origin data || true
+
+      - name: Switch to data branch and sync code from main
+        run: |
+          git switch data || git switch -c data
+          git merge origin/main --no-edit || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Hourly ingest (save ~6 frames into seq folder)
+        env:
+          PYTHONUNBUFFERED: "1"
+          # Save into day/hour sequence folder (UTC)
+          TARGET_SAVED: "6"
+          # give it room to search back if some timestamps fail
+          MAX_FRAMES: "60"
+          LOOKBACK_HOURS: "6"
+        run: |
+          DAY=$(date -u +%F)
+          SEQ=$(date -u +seq_%Y%m%dT%H0000Z)
+          OUTDIR="data/raw/${DAY}/sequences/${SEQ}"
+          mkdir -p "${OUTDIR}"
+
+          # your ingest module respects HIMAWARI_OUT_DIR
+          HIMAWARI_OUT_DIR="${OUTDIR}" python -m himawari_ml.ingest.fetch_latest
+
+      - name: Commit sequence to data branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+
+          git add -f data/raw || true
+          git commit -m "ingest(hourly): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No changes"
+          git push origin data
+

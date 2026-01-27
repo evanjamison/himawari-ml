@@ -16,6 +16,11 @@ DATA_RAW = REPO_ROOT / "data" / "raw"
 DATA_SAMPLE_RAW = REPO_ROOT / "data" / "sample" / "raw"
 DATA_DERIVED = REPO_ROOT / "data" / "derived"
 
+"""
+Build a CSV inventory of per-frame image features for analysis and visualization.
+(Not used for ML training.)
+"""
+
 # Now that we extract real features, require them by default.
 # NOTE: We do NOT require Himawari parsing columns here (to avoid breaking on non-matching filenames).
 DEFAULT_REQUIRED_COLS = [

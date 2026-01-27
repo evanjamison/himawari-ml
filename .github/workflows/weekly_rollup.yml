@@ -1,0 +1,89 @@
+name: weekly-rollup
+
+on:
+  schedule:
+    - cron: "30 9 * * 1"   # Mondays 09:30 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-rollup
+  cancel-in-progress: false
+
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (code)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch data branch
+        run: |
+          git fetch origin data || true
+
+      - name: Switch to data branch and sync code from main
+        run: |
+          git switch data || git switch -c data
+          git merge origin/main --no-edit || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Stage last 7 daily masters -> weekly bundle
+        run: |
+          WEEK=$(date -u +%G-W%V)
+          BUNDLE="out/bundles/week_${WEEK}"
+          mkdir -p "${BUNDLE}"
+
+          # Build inputs list: last 7 UTC days’ master folders
+          INPUTS=""
+          for i in 1 2 3 4 5 6 7; do
+            DAY=$(date -u -d "${i} day ago" +%F)
+            P="data/raw/${DAY}/master/frames"
+            if [ -d "${P}" ]; then
+              INPUTS="${INPUTS} ${P}"
+            fi
+          done
+
+          if [ -z "${INPUTS}" ]; then
+            echo "No master frames found for last 7 days."
+            exit 0
+          fi
+
+          python scripts/pipeline/stage_frames.py \
+            --inputs ${INPUTS} \
+            --outdir "${BUNDLE}" \
+            --recursive \
+            --mode copy
+
+      - name: Run Phase 2 on weekly bundle
+        run: |
+          WEEK=$(date -u +%G-W%V)
+          RAWDIR="out/bundles/week_${WEEK}/frames"
+          OUTDIR="out/week_${WEEK}/weekly"
+          mkdir -p "${OUTDIR}"
+
+          python scripts/pipeline/run_sample_pipeline.py \
+            --raw-dir "${RAWDIR}" \
+            --outdir "${OUTDIR}"
+
+      - name: Commit weekly bundle + outputs
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+
+          git add -f out || true
+          git commit -m "rollup+phase2(weekly): $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No changes"
+          git push origin data
+
