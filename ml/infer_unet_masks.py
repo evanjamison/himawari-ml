@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -28,7 +28,7 @@ while not (REPO_ROOT / "pyproject.toml").exists() and not (REPO_ROOT / ".git").e
 # -------------------------
 def _double_conv(in_ch: int, out_ch: int) -> nn.Sequential:
     # indices: 0 conv, 1 bn, 2 relu, 3 conv, 4 bn, 5 relu
-    # (this matches keys like enc2.4.running_mean)
+    # (matches keys like enc2.4.running_mean)
     return nn.Sequential(
         nn.Conv2d(in_ch, out_ch, 3, padding=1),
         nn.BatchNorm2d(out_ch),
@@ -40,7 +40,7 @@ def _double_conv(in_ch: int, out_ch: int) -> nn.Sequential:
 
 
 class UNetEncDec(nn.Module):
-    def __init__(self, in_ch: int = 3, base: int = 32, out_ch: int = 1):
+    def __init__(self, in_ch: int = 3, base: int = 16, out_ch: int = 1):
         super().__init__()
 
         self.enc1 = _double_conv(in_ch, base)
@@ -52,7 +52,6 @@ class UNetEncDec(nn.Module):
 
         self.bottleneck = _double_conv(base * 8, base * 16)
 
-        # upsampling path
         self.up4 = nn.ConvTranspose2d(base * 16, base * 8, kernel_size=2, stride=2)
         self.dec4 = _double_conv(base * 16, base * 8)
 
@@ -95,7 +94,6 @@ class UNetEncDec(nn.Module):
 
 
 def _concat_with_pad(x_up: torch.Tensor, x_skip: torch.Tensor) -> torch.Tensor:
-    # Handle odd sizes safely
     diffY = x_skip.size(2) - x_up.size(2)
     diffX = x_skip.size(3) - x_up.size(3)
     x_up = F.pad(x_up, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
@@ -131,53 +129,54 @@ def to_repo_rel(p: Path) -> str:
 
 
 # -------------------------
-# Checkpoint loading (robust)
+# Checkpoint utilities
 # -------------------------
 def extract_state_dict(ckpt_obj) -> Dict[str, torch.Tensor]:
-    # Common patterns
     if isinstance(ckpt_obj, dict):
         for k in ("model", "state_dict", "model_state_dict"):
             if k in ckpt_obj and isinstance(ckpt_obj[k], dict):
                 return ckpt_obj[k]
-    # Raw state_dict
-    if isinstance(ckpt_obj, dict):
         return ckpt_obj
     raise ValueError("Unrecognized checkpoint format")
 
 
 def normalize_keys(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    out = {}
+    out: Dict[str, torch.Tensor] = {}
     for k, v in sd.items():
         nk = k
         if nk.startswith("module."):
             nk = nk[len("module.") :]
-        # common alt names: upconv4 -> up4
+
         nk = nk.replace("upconv4", "up4").replace("upconv3", "up3").replace("upconv2", "up2").replace("upconv1", "up1")
         nk = nk.replace("up_conv4", "up4").replace("up_conv3", "up3").replace("up_conv2", "up2").replace("up_conv1", "up1")
         nk = nk.replace("final_conv", "final")
+
         out[nk] = v
     return out
 
 
-def load_model_weights(model: nn.Module, ckpt_path: Path, device: torch.device) -> None:
-    ckpt_obj = torch.load(ckpt_path, map_location=device)
-    sd = extract_state_dict(ckpt_obj)
-    sd = normalize_keys(sd)
+def infer_base_ch_from_ckpt(sd: Dict[str, torch.Tensor]) -> Optional[int]:
+    """
+    Infer base channels from bottleneck first conv weight:
+      bottleneck.0.weight has shape [base*16, base*8, 3, 3]
+    So base = out_channels / 16.
+    """
+    w = sd.get("bottleneck.0.weight")
+    if w is None:
+        return None
+    out_ch = int(w.shape[0])
+    if out_ch % 16 != 0:
+        return None
+    base = out_ch // 16
+    # sanity: common values 16/32/64
+    if base <= 0:
+        return None
+    return base
 
-    try:
-        model.load_state_dict(sd, strict=True)
-        return
-    except RuntimeError:
-        # Fall back to non-strict, but still fail if basically nothing matches.
-        missing, unexpected = model.load_state_dict(sd, strict=False)
 
-        # If nearly everything is missing, that's not a "minor mismatch"—hard fail.
-        total_params = len(model.state_dict().keys())
-        if len(missing) > int(0.6 * total_params):
-            raise RuntimeError(
-                "Checkpoint does not match inference architecture (too many missing keys). "
-                f"Missing={len(missing)} Unexpected={len(unexpected)}"
-            )
+def load_model_weights(model: nn.Module, sd: Dict[str, torch.Tensor]) -> None:
+    # strict load should succeed now that base matches
+    model.load_state_dict(sd, strict=True)
 
 
 # -------------------------
@@ -186,17 +185,18 @@ def load_model_weights(model: nn.Module, ckpt_path: Path, device: torch.device) 
 def main() -> int:
     ap = argparse.ArgumentParser()
 
-    # Phase 3 runner mode
     ap.add_argument("--frames", default="", help="Directory containing input frames/images")
     ap.add_argument("--recursive", action="store_true", help="Recursively search --frames directory")
 
-    # Old metrics-driven mode
     ap.add_argument("--metrics-csv", default="", help="CSV with 'relpath' (optionally 'img_ok'). If set, uses this mode.")
 
     ap.add_argument("--ckpt", required=True, help="Path to trained .pt checkpoint")
     ap.add_argument("--outdir", required=True, help="Output directory for Phase 3 artifacts")
     ap.add_argument("--image-size", type=int, default=256)
-    ap.add_argument("--base-ch", type=int, default=32)
+
+    # If you pass --base-ch we will honor it; otherwise we auto-detect from ckpt.
+    ap.add_argument("--base-ch", type=int, default=0, help="UNet base channels (0 = auto from checkpoint)")
+
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--device", default="", help="cpu|cuda (default auto)")
     args = ap.parse_args()
@@ -208,9 +208,28 @@ def main() -> int:
 
     out_root = Path(args.outdir).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
-
     out_masks = out_root / "masks_unet"
     out_masks.mkdir(parents=True, exist_ok=True)
+
+    # Device
+    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load checkpoint first (so we can infer base channels)
+    ckpt_path = Path(args.ckpt)
+    if not ckpt_path.is_absolute():
+        ckpt_path = (REPO_ROOT / ckpt_path).resolve()
+    if not ckpt_path.exists():
+        raise SystemExit(f"ERROR: --ckpt not found: {ckpt_path}")
+
+    ckpt_obj = torch.load(ckpt_path, map_location=device)
+    sd = normalize_keys(extract_state_dict(ckpt_obj))
+
+    base_ch = int(args.base_ch)
+    if base_ch <= 0:
+        inferred = infer_base_ch_from_ckpt(sd)
+        if inferred is None:
+            raise SystemExit("ERROR: Could not auto-infer --base-ch from checkpoint. Please pass --base-ch explicitly.")
+        base_ch = inferred
 
     # Collect images + build df
     if metrics_csv:
@@ -237,7 +256,6 @@ def main() -> int:
             else:
                 p = p.resolve()
             img_paths.append(p)
-
     else:
         frames_dir = Path(frames_arg).expanduser()
         if not frames_dir.is_absolute():
@@ -251,18 +269,9 @@ def main() -> int:
 
         df = pd.DataFrame({"relpath": [to_repo_rel(p) for p in img_paths]})
 
-    # Device
-    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Load model + weights
-    ckpt_path = Path(args.ckpt)
-    if not ckpt_path.is_absolute():
-        ckpt_path = (REPO_ROOT / ckpt_path).resolve()
-    if not ckpt_path.exists():
-        raise SystemExit(f"ERROR: --ckpt not found: {ckpt_path}")
-
-    model = UNetEncDec(in_ch=3, base=int(args.base_ch), out_ch=1).to(device)
-    load_model_weights(model, ckpt_path, device)
+    # Build model with correct base, then load weights
+    model = UNetEncDec(in_ch=3, base=base_ch, out_ch=1).to(device)
+    load_model_weights(model, sd)
     model.eval()
 
     # Inference
@@ -293,9 +302,14 @@ def main() -> int:
     out_csv = out_root / "cloud_metrics_unet.csv"
     df.to_csv(out_csv, index=False)
 
+    print(f"Auto base-ch: {base_ch}")
     print(f"Wrote: {out_csv}")
     print(f"Wrote masks: {out_masks}")
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 
 if __name__ == "__main__":
