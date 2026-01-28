@@ -1,0 +1,16 @@
+# Allow tracking of raw data in data branch
+!raw/
+!raw/**
+
+# Allow images
+!raw/**/*.png
+!raw/**/*.jpg
+!raw/**/*.jpeg
+
+# Allow outputs
+!interim/
+!processed/
+!derived/
+
+# Allow out/ artifacts
+!../out/**
