@@ -2,7 +2,7 @@ name: ingest-hourly
 
 on:
   schedule:
-    - cron: "7 * * * *"   # hourly at minute 7
+    - cron: "0 * * * *"   # hourly (UTC)
   workflow_dispatch:
 
 permissions:
@@ -17,101 +17,76 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ------------------------------------------------------------------
-      # 1) Checkout MAIN (code) into ./code
-      # ------------------------------------------------------------------
       - name: Checkout main (code)
         uses: actions/checkout@v4
         with:
           ref: main
-          path: code
-          fetch-depth: 1
-
-      # ------------------------------------------------------------------
-      # 2) Checkout DATA (data) into ./data
-      # ------------------------------------------------------------------
-      - name: Checkout data branch (data)
-        uses: actions/checkout@v4
-        with:
-          ref: data
-          path: data
           fetch-depth: 0
 
-      # ------------------------------------------------------------------
-      # 3) Configure git identity (required for commits)
-      # ------------------------------------------------------------------
-      - name: Configure git identity
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config --global user.name "github-actions"
-          git config --global user.email "github-actions@users.noreply.github.com"
+      - name: Fetch data branch
+        run: git fetch origin data
 
-      # ------------------------------------------------------------------
-      # 4) Setup Python
-      # ------------------------------------------------------------------
+      - name: Switch to data branch and sync code from main
+        run: |
+          set -e
+          git switch data || git switch -c data
+          git merge origin/main --no-edit || true
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ------------------------------------------------------------------
-      # 5) Install dependencies + INSTALL PACKAGE (src layout)
-      # ------------------------------------------------------------------
       - name: Install deps
-        shell: bash
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r code/requirements.txt
-          pip install -e code   # <-- THIS is the critical fix
+          pip install -r requirements.txt
+          pip install -e .
 
-      # ------------------------------------------------------------------
-      # 6) Hourly ingest (save ~6 frames into sequence/)
-      # ------------------------------------------------------------------
-      - name: Hourly ingest (sequence)
-        shell: bash
+      - name: Hourly ingest (save ~24 frames)
+        env:
+          PYTHONUNBUFFERED: "1"
+          TARGET_SAVED: "24"
+          MAX_FRAMES: "60"
+          LOOKBACK_HOURS: "6"
         run: |
           set -euo pipefail
 
           DAY="$(date -u +%F)"
-          OUTDIR="$GITHUB_WORKSPACE/data/data/raw/${DAY}/sequence"
+          OUTDIR="data/raw/${DAY}/latest"
 
           mkdir -p "$OUTDIR"
 
-          echo "DAY=$DAY"
-          echo "OUTDIR=$OUTDIR"
+          echo "Ingesting into $OUTDIR"
 
-          # sanity check
-          python - << 'EOF'
-          import himawari_ml
-          print("himawari_ml import OK:", himawari_ml.__file__)
-          EOF
+          HIMAWARI_OUT_DIR="$OUTDIR" \
+          python -m himawari_ml.ingest.fetch_latest
 
-          python -m himawari_ml.ingest.fetch_latest \
-            --outdir "$OUTDIR" \
-            --n 6
-
-          echo "---- sequence sample ----"
+          echo "---- directory contents ----"
           ls -la "$OUTDIR" | head -n 50 || true
 
-      # ------------------------------------------------------------------
-      # 7) Commit new frames to DATA branch
-      # ------------------------------------------------------------------
       - name: Commit raw frames to data
-        shell: bash
-        working-directory: data
         run: |
           set -euo pipefail
 
-          git add data/raw || true
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+
+          DAY="$(date -u +%F)"
+
+          echo "---- git status BEFORE add ----"
+          git status --porcelain || true
+
+          # FORCE add today's folder (bypasses .gitignore)
+          git add -f "data/raw/${DAY}" || true
+
+          echo "---- git status AFTER add ----"
+          git status --porcelain || true
 
           if git diff --cached --quiet; then
             echo "No new frames to commit."
             exit 0
           fi
 
-          DAY="$(date -u +%F)"
-          git commit -m "ingest hourly: ${DAY} (sequence)"
+          git commit -m "ingest(hourly): ${DAY} $(date -u +'%H:%MZ')"
           git push origin data
-
