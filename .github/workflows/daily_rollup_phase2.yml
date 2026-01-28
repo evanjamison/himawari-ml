@@ -203,9 +203,6 @@ jobs:
       # ----------------------------
       - name: Run Phase 3 (U-Net inference)
         shell: bash
-        env:
-          # Put your model on the data branch at this stable path
-          MODEL_PATH: out/models/unet_cloudmask_latest.pt
         run: |
           set -euo pipefail
 
@@ -213,14 +210,36 @@ jobs:
           FRAMES="${{ steps.resolve.outputs.outframes }}"
           OUTP3="${{ steps.resolve.outputs.phase3_out }}"
 
-          if [[ ! -f "$MODEL_PATH" ]]; then
-            echo "ERROR: MODEL_PATH not found: $MODEL_PATH"
-            echo "Fix: commit your model to data branch at out/models/unet_cloudmask_latest.pt"
-            ls -la out/models || true
+          mkdir -p "$OUTP3"
+
+          # Preferred stable location
+          MODEL_CANDIDATE="out/models/unet_cloudmask_latest.pt"
+
+          if [[ -f "$MODEL_CANDIDATE" ]]; then
+            MODEL_PATH="$MODEL_CANDIDATE"
+          else
+            echo "MODEL_CANDIDATE missing: $MODEL_CANDIDATE"
+            echo "Searching for any unet *.pt in repo..."
+
+            # Find newest matching model in repo
+            MODEL_PATH="$(find . -type f \( -name 'unet_cloudmask*.pt' -o -name '*unet*.pt' \) \
+              -not -path './.git/*' \
+              -printf '%T@ %p\n' | sort -nr | head -n 1 | awk '{print $2}')"
+          fi
+
+          echo "---- model candidates (top 20 newest) ----"
+          find . -type f \( -name 'unet_cloudmask*.pt' -o -name '*unet*.pt' \) \
+            -not -path './.git/*' \
+            -printf '%TY-%Tm-%Td %TH:%TM:%TS %p\n' | sort -r | head -n 20 || true
+
+          if [[ -z "${MODEL_PATH:-}" ]] || [[ ! -f "$MODEL_PATH" ]]; then
+            echo "ERROR: No U-Net model .pt found anywhere in this checkout."
+            echo "Fix: commit a model to the data branch (recommended path: out/models/unet_cloudmask_latest.pt)"
             exit 1
           fi
 
-          mkdir -p "$OUTP3"
+          echo "Using MODEL_PATH=$MODEL_PATH"
+          ls -la "$MODEL_PATH"
 
           python scripts/pipeline/run_phase3_unet_daily.py \
             --day "$DAY" \
@@ -229,7 +248,8 @@ jobs:
             --outdir "$OUTP3"
 
           echo "---- Phase 3 outputs ----"
-          find "$OUTP3" -maxdepth 3 -type f | head -n 120 || true
+          find "$OUTP3" -maxdepth 3 -type f | head -n 200 || true
+
 
       # Optional but very useful: download from Actions UI even if you don't commit outputs
       - name: Upload Phase 3 outputs (artifact)
