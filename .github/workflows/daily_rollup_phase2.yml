@@ -35,6 +35,17 @@ jobs:
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@users.noreply.github.com"
 
+      # ✅ KEY FIX: bring code from main into this workspace WITHOUT merging branches
+      - name: Bring pipeline code from main (no merge)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main --depth=1
+          # Pull only code + deps files needed to run python scripts
+          git checkout origin/main -- src scripts requirements.txt pyproject.toml || true
+          echo "---- verify filter_black_frames.py exists ----"
+          ls -la scripts/pipeline/filter_black_frames.py
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -129,8 +140,6 @@ jobs:
 
           mkdir -p "$CLEANROOT" "$QUAR"
 
-          # Tune thresholds if needed:
-          # mean-max/std-max around 6 catches "basically black / near-uniform dark"
           python scripts/pipeline/filter_black_frames.py \
             --inputs "$INROOT" \
             --outdir "$CLEANROOT" \
@@ -140,13 +149,6 @@ jobs:
             --mode copy
 
           echo "cleanroot=$CLEANROOT" >> "$GITHUB_OUTPUT"
-          echo "quarantine=$QUAR" >> "$GITHUB_OUTPUT"
-
-          echo "---- CLEANROOT sample ----"
-          find "$CLEANROOT" -type f -name "*.png" | head -n 20 || true
-
-          echo "---- QUARANTINE sample ----"
-          find "$QUAR" -type f -name "*.png" | head -n 20 || true
 
       - name: Stage frames by copying CLEANROOT -> master/frames
         shell: bash
@@ -158,12 +160,6 @@ jobs:
 
           mkdir -p "$OUTFRAMES"
 
-          echo "CLEAN INROOT=$INROOT"
-          echo "OUTFRAMES=$OUTFRAMES"
-          echo "---- CLEAN INROOT sample ----"
-          ls -la "$INROOT" | head -n 80 || true
-
-          # Copy PNGs into master/frames. Supports nested directories.
           shopt -s globstar nullglob
           COPIED=0
           for f in "$INROOT"/**/*.png "$INROOT"/*.png; do
@@ -180,9 +176,6 @@ jobs:
             exit 1
           fi
 
-          echo "---- OUTFRAMES sample ----"
-          ls -la "$OUTFRAMES" | head -n 80 || true
-
       - name: Run Phase 2
         shell: bash
         run: |
@@ -190,12 +183,6 @@ jobs:
           mkdir -p "${{ steps.resolve.outputs.outdir }}"
 
           RAWDIR="${{ steps.resolve.outputs.outframes }}"
-          if [[ ! -d "$RAWDIR" ]] || [[ "$(find "$RAWDIR" -type f 2>/dev/null | wc -l)" -eq 0 ]]; then
-            RAWDIR="${{ steps.resolve.outputs.outmaster }}"
-          fi
-
-          echo "Using RAWDIR=$RAWDIR"
-          ls -la "$RAWDIR" | head -n 80 || true
 
           python scripts/pipeline/run_sample_pipeline.py \
             --raw-dir "$RAWDIR" \
@@ -206,7 +193,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # filtered/ and rejects/ live under data/raw/YYYY-MM-DD/, so they'll be included here too
           git add -f data/raw out || true
           git commit -m "daily rollup + phase2: ${{ steps.resolve.outputs.day }}" || echo "No changes"
           git push origin data
