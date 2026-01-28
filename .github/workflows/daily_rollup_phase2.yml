@@ -113,22 +113,55 @@ jobs:
           echo "OUTFRAMES=${{ steps.resolve.outputs.outframes }}"
           echo "OUTDIR=${{ steps.resolve.outputs.outdir }}"
           echo "---- INROOT listing ----"
-          ls -la "${{ steps.resolve.outputs.inroot }}" | head -n 50 || true
+          ls -la "${{ steps.resolve.outputs.inroot }}" | head -n 80 || true
 
-      - name: Stage frames by copying inputs -> master/frames
+      - name: Filter black frames (pre-stage)
+        id: filter
         shell: bash
         run: |
           set -euo pipefail
 
           INROOT="${{ steps.resolve.outputs.inroot }}"
+          DAYDIR="${{ steps.resolve.outputs.daydir }}"
+
+          CLEANROOT="$DAYDIR/filtered"
+          QUAR="$DAYDIR/rejects/black"
+
+          mkdir -p "$CLEANROOT" "$QUAR"
+
+          # Tune thresholds if needed:
+          # mean-max/std-max around 6 catches "basically black / near-uniform dark"
+          python scripts/pipeline/filter_black_frames.py \
+            --inputs "$INROOT" \
+            --outdir "$CLEANROOT" \
+            --quarantine "$QUAR" \
+            --mean-max 6 \
+            --std-max 6 \
+            --mode copy
+
+          echo "cleanroot=$CLEANROOT" >> "$GITHUB_OUTPUT"
+          echo "quarantine=$QUAR" >> "$GITHUB_OUTPUT"
+
+          echo "---- CLEANROOT sample ----"
+          find "$CLEANROOT" -type f -name "*.png" | head -n 20 || true
+
+          echo "---- QUARANTINE sample ----"
+          find "$QUAR" -type f -name "*.png" | head -n 20 || true
+
+      - name: Stage frames by copying CLEANROOT -> master/frames
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INROOT="${{ steps.filter.outputs.cleanroot }}"
           OUTFRAMES="${{ steps.resolve.outputs.outframes }}"
 
           mkdir -p "$OUTFRAMES"
 
-          echo "INROOT=$INROOT"
+          echo "CLEAN INROOT=$INROOT"
           echo "OUTFRAMES=$OUTFRAMES"
-          echo "---- INROOT sample ----"
-          ls -la "$INROOT" | head -n 50 || true
+          echo "---- CLEAN INROOT sample ----"
+          ls -la "$INROOT" | head -n 80 || true
 
           # Copy PNGs into master/frames. Supports nested directories.
           shopt -s globstar nullglob
@@ -143,13 +176,12 @@ jobs:
           echo "Copied $COPIED png files into $OUTFRAMES"
 
           if [[ "$COPIED" -eq 0 ]]; then
-            echo "ERROR: No PNG frames found under $INROOT"
+            echo "ERROR: No PNG frames found under cleaned root: $INROOT"
             exit 1
           fi
 
           echo "---- OUTFRAMES sample ----"
-          ls -la "$OUTFRAMES" | head -n 50 || true
-
+          ls -la "$OUTFRAMES" | head -n 80 || true
 
       - name: Run Phase 2
         shell: bash
@@ -157,14 +189,13 @@ jobs:
           set -euo pipefail
           mkdir -p "${{ steps.resolve.outputs.outdir }}"
 
-          # Prefer OUTFRAMES if it exists + non-empty, else fall back to OUTMASTER (some stage scripts write there)
           RAWDIR="${{ steps.resolve.outputs.outframes }}"
           if [[ ! -d "$RAWDIR" ]] || [[ "$(find "$RAWDIR" -type f 2>/dev/null | wc -l)" -eq 0 ]]; then
             RAWDIR="${{ steps.resolve.outputs.outmaster }}"
           fi
 
           echo "Using RAWDIR=$RAWDIR"
-          ls -la "$RAWDIR" | head -n 50 || true
+          ls -la "$RAWDIR" | head -n 80 || true
 
           python scripts/pipeline/run_sample_pipeline.py \
             --raw-dir "$RAWDIR" \
@@ -175,6 +206,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # filtered/ and rejects/ live under data/raw/YYYY-MM-DD/, so they'll be included here too
           git add -f data/raw out || true
           git commit -m "daily rollup + phase2: ${{ steps.resolve.outputs.day }}" || echo "No changes"
           git push origin data

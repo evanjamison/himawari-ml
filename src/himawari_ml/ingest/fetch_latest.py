@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
 import requests
-from PIL import Image, ImageStat
+from PIL import Image
 
 from himawari_ml.utils.paths import raw_latest_dir, frame_filename
 
@@ -49,9 +49,6 @@ elif _HV in ("1", "true", "yes"):
 else:
     VERIFY_SSL = (not IN_GHA)
 
-# Darkness threshold (inside Earth disk only). Higher = allow more nighttime.
-MAX_DARK_FRAC = float(os.getenv("MAX_DARK_FRAC", "0.85"))
-
 # Tiling config for full disk (4d / 550 -> 4x4 tiles)
 LEVEL = 4
 TILE_SIZE = 550
@@ -67,14 +64,16 @@ class FetchCfg:
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-def _is_valid_png_bytes(b: bytes, min_bytes: int = 8000) -> bool:
-    if b is None:
+def _is_png_bytes(b: bytes | None) -> bool:
+    """
+    Relaxed validation:
+      - NO min-size threshold
+      - only require PNG magic bytes
+    This avoids discarding small-but-valid PNGs while still rejecting HTML/error bodies.
+    """
+    if not b:
         return False
-    if len(b) < min_bytes:
-        return False
-    if not b.startswith(PNG_MAGIC):
-        return False
-    return True
+    return b.startswith(PNG_MAGIC)
 
 
 def _session() -> requests.Session:
@@ -93,7 +92,8 @@ def _get(s: requests.Session, url: str, cfg: FetchCfg) -> bytes | None:
             r.raise_for_status()
 
             b = r.content
-            if not _is_valid_png_bytes(b):
+            if not _is_png_bytes(b):
+                # treat as missing/corrupt (often an HTML error page)
                 return None
             return b
         except Exception as e:
@@ -120,37 +120,13 @@ def _center_crop_square(img: Image.Image) -> Image.Image:
     return img.crop((left, top, left + side, top + side))
 
 
-def _earth_disk_mask(img_rgb: Image.Image, thresh: int = 12) -> Image.Image:
-    g = img_rgb.convert("L")
-    return g.point(lambda p: 255 if p > thresh else 0)
-
-
-def _dark_fraction_on_disk(img_rgb: Image.Image) -> float:
-    mask = _earth_disk_mask(img_rgb, thresh=12)
-    g = img_rgb.convert("L")
-
-    outside_fill = 128
-    g2 = Image.composite(g, Image.new("L", g.size, outside_fill), mask)
-
-    hist = g2.histogram()
-    if sum(hist) == 0:
-        return 1.0
-
-    near_black = sum(hist[:10])
-    inside = ImageStat.Stat(mask).sum[0] / 255.0
-    if inside <= 0:
-        return 1.0
-
-    return float(near_black / inside)
-
-
 def fetch_frame(ts: datetime, out_dir: Path, image_size: int, cfg: FetchCfg) -> bool:
     y, m, d = ts.strftime("%Y"), ts.strftime("%m"), ts.strftime("%d")
     hms = ts.strftime("%H%M%S")
     rel_prefix = f"D531106/{LEVEL}d/{TILE_SIZE}/{y}/{m}/{d}/{hms}"
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / frame_filename(ts)  # ✅ full UTC timestamp filename
+    out_path = out_dir / frame_filename(ts)  # full UTC timestamp filename
 
     s = _session()
 
@@ -176,13 +152,9 @@ def fetch_frame(ts: datetime, out_dir: Path, image_size: int, cfg: FetchCfg) -> 
             cropped = _center_crop_square(full)
             resized = cropped.resize((image_size, image_size), Image.BILINEAR)
 
-            dark_frac = _dark_fraction_on_disk(resized)
-            if dark_frac > MAX_DARK_FRAC:
-                log.info(f"Skip {out_path.name} (dark_frac_on_disk={dark_frac:.3f} > {MAX_DARK_FRAC})")
-                return False
-
+            # ✅ No darkness filter — always save if stitched successfully
             resized.save(out_path)
-            log.info(f"Saved {out_path} (dark_frac_on_disk={dark_frac:.3f})")
+            log.info(f"Saved {out_path}")
             return True
 
         except Exception as e:
@@ -197,7 +169,7 @@ def main(
     max_frames: int = MAX_FRAMES_DEFAULT,
     image_size: int = DEFAULT_IMAGE_SIZE,
 ) -> int:
-    # ✅ Production default: data/raw/YYYY-MM-DD/latest/
+    # Production default: data/raw/YYYY-MM-DD/latest/
     # Optional override: HIMAWARI_OUT_DIR=/some/path
     out = Path(os.getenv("HIMAWARI_OUT_DIR", "")).expanduser() if os.getenv("HIMAWARI_OUT_DIR") else raw_latest_dir()
 
@@ -217,7 +189,7 @@ def main(
 
     log.info(
         f"Done. Saved {saved} frames (checked {checked}). "
-        f"out={out} verify_ssl={VERIFY_SSL} target_saved={TARGET_SAVED} max_dark_frac={MAX_DARK_FRAC}"
+        f"out={out} verify_ssl={VERIFY_SSL} target_saved={TARGET_SAVED}"
     )
     return 0
 
