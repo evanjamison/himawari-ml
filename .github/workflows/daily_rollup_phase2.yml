@@ -42,12 +42,12 @@ jobs:
           set -euo pipefail
           git fetch origin main --depth=1
           # Pull only code + deps files needed to run python scripts
-          git checkout origin/main -- src scripts requirements.txt pyproject.toml || true
+          git checkout origin/main -- src scripts ml requirements.txt pyproject.toml || true
 
           echo "---- verify filter_black_frames.py exists ----"
           ls -la scripts/pipeline/filter_black_frames.py
 
-          echo "---- verify Phase 3 runner exists ----"
+          echo "---- verify phase3 runner exists ----"
           ls -la scripts/pipeline/run_phase3_unet_daily.py
 
       - name: Setup Python
@@ -110,16 +110,12 @@ jobs:
           OUTFRAMES="$OUTMASTER/frames"
           OUTDIR="out/$DAY/daily"
 
-          # ✅ Phase 3 outputs live here
-          PHASE3_OUT="out/$DAY/phase3_unet"
-
           echo "day=$DAY" >> "$GITHUB_OUTPUT"
           echo "daydir=$DAYDIR" >> "$GITHUB_OUTPUT"
           echo "inroot=$INROOT" >> "$GITHUB_OUTPUT"
           echo "outmaster=$OUTMASTER" >> "$GITHUB_OUTPUT"
           echo "outframes=$OUTFRAMES" >> "$GITHUB_OUTPUT"
           echo "outdir=$OUTDIR" >> "$GITHUB_OUTPUT"
-          echo "phase3_out=$PHASE3_OUT" >> "$GITHUB_OUTPUT"
 
       - name: Debug resolved paths
         shell: bash
@@ -131,7 +127,6 @@ jobs:
           echo "OUTMASTER=${{ steps.resolve.outputs.outmaster }}"
           echo "OUTFRAMES=${{ steps.resolve.outputs.outframes }}"
           echo "OUTDIR=${{ steps.resolve.outputs.outdir }}"
-          echo "PHASE3_OUT=${{ steps.resolve.outputs.phase3_out }}"
           echo "---- INROOT listing ----"
           ls -la "${{ steps.resolve.outputs.inroot }}" | head -n 80 || true
 
@@ -198,66 +193,64 @@ jobs:
             --outdir "${{ steps.resolve.outputs.outdir }}" \
             --save-overlays
 
-      # ----------------------------
+      # -------------------------
       # ✅ Phase 3: U-Net inference
-      # ----------------------------
+      # -------------------------
+      - name: Resolve U-Net model checkpoint
+        id: model
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Preferred canonical path (what the workflow expects)
+          CANON="out/models/unet_cloudmask_latest.pt"
+
+          if [[ -f "$CANON" ]]; then
+            echo "model_path=$CANON" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "MODEL_CANDIDATE missing: $CANON"
+          echo "Searching for any *.pt in repo (top 20 newest)..."
+          mapfile -t CANDS < <(find . -type f -name "*.pt" -printf "%T@|%p\n" | sort -nr | head -n 20 | cut -d'|' -f2-)
+
+          printf '%s\n' "${CANDS[@]}" || true
+
+          if [[ ${#CANDS[@]} -eq 0 ]]; then
+            echo "ERROR: No U-Net model .pt found anywhere in this checkout."
+            echo "Fix: commit a model to the data branch (recommended path: out/models/unet_cloudmask_latest.pt)"
+            exit 1
+          fi
+
+          # Pick newest .pt
+          echo "model_path=${CANDS[0]}" >> "$GITHUB_OUTPUT"
+
       - name: Run Phase 3 (U-Net inference)
         shell: bash
         run: |
           set -euo pipefail
 
           DAY="${{ steps.resolve.outputs.day }}"
-          FRAMES="${{ steps.resolve.outputs.outframes }}"
-          OUTP3="${{ steps.resolve.outputs.phase3_out }}"
+          MODEL_PATH="${{ steps.model.outputs.model_path }}"
 
-          mkdir -p "$OUTP3"
-
-          # Preferred stable location
-          MODEL_CANDIDATE="out/models/unet_cloudmask_latest.pt"
-
-          if [[ -f "$MODEL_CANDIDATE" ]]; then
-            MODEL_PATH="$MODEL_CANDIDATE"
-          else
-            echo "MODEL_CANDIDATE missing: $MODEL_CANDIDATE"
-            echo "Searching for any unet *.pt in repo..."
-
-            # Find newest matching model in repo
-            MODEL_PATH="$(find . -type f \( -name 'unet_cloudmask*.pt' -o -name '*unet*.pt' \) \
-              -not -path './.git/*' \
-              -printf '%T@ %p\n' | sort -nr | head -n 1 | awk '{print $2}')"
-          fi
-
-          echo "---- model candidates (top 20 newest) ----"
-          find . -type f \( -name 'unet_cloudmask*.pt' -o -name '*unet*.pt' \) \
-            -not -path './.git/*' \
-            -printf '%TY-%Tm-%Td %TH:%TM:%TS %p\n' | sort -r | head -n 20 || true
-
-          if [[ -z "${MODEL_PATH:-}" ]] || [[ ! -f "$MODEL_PATH" ]]; then
-            echo "ERROR: No U-Net model .pt found anywhere in this checkout."
-            echo "Fix: commit a model to the data branch (recommended path: out/models/unet_cloudmask_latest.pt)"
-            exit 1
-          fi
-
+          echo "Using DAY=$DAY"
           echo "Using MODEL_PATH=$MODEL_PATH"
-          ls -la "$MODEL_PATH"
+          ls -la "$MODEL_PATH" || true
+          ls -la "data/raw/$DAY/master/frames" | head -n 50 || true
 
+          # IMPORTANT: this script does NOT accept --frames-dir/--model/--outdir
           python scripts/pipeline/run_phase3_unet_daily.py \
             --day "$DAY" \
-            --frames-dir "$FRAMES" \
-            --model "$MODEL_PATH" \
-            --outdir "$OUTP3"
+            --checkpoint "$MODEL_PATH" \
+            --threshold 0.5 \
+            --size 256 \
+            --device cpu
 
-          echo "---- Phase 3 outputs ----"
-          find "$OUTP3" -maxdepth 3 -type f | head -n 200 || true
-
-
-      # Optional but very useful: download from Actions UI even if you don't commit outputs
       - name: Upload Phase 3 outputs (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: phase3_unet_${{ steps.resolve.outputs.day }}
-          path: ${{ steps.resolve.outputs.phase3_out }}
-          if-no-files-found: warn
+          path: out/${{ steps.resolve.outputs.day }}/phase3_unet
 
       - name: Commit results to data
         shell: bash
@@ -266,3 +259,4 @@ jobs:
           git add -f data/raw out || true
           git commit -m "daily rollup + phase2 + phase3: ${{ steps.resolve.outputs.day }}" || echo "No changes"
           git push origin data
+
