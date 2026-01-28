@@ -1,90 +1,19 @@
-# ----------------------------
-# Python / venv
-# ----------------------------
-__pycache__/
-*.py[cod]
-*.pyd
-*.so
-.Python
-.venv/
-venv/
-ENV/
-.env
-.env.*
-pip-wheel-metadata/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+# data branch: track everything under data/raw and related buckets
 
-# ----------------------------
-# Jupyter
-# ----------------------------
-.ipynb_checkpoints/
+# re-include directories so git traverses them
+!raw/
+!raw/**
 
-# ----------------------------
-# OS
-# ----------------------------
-.DS_Store
-Thumbs.db
+!interim/
+!interim/**
+!processed/
+!processed/**
+!derived/
+!derived/**
 
-# ----------------------------
-# Logs
-# ----------------------------
-*.log
-
-# ----------------------------
-# Packaging
-# ----------------------------
-dist/
-build/
-*.egg-info/
-
-# ----------------------------
-# Project data + generated outputs
-# ----------------------------
-
-# ---- RAW DATA (tracked for CI on data branch) ----
-# Ignore everything under data/raw by default...
-data/raw/*
-
-# ...but keep day folders like data/raw/2026-01-27/ and ALL their contents
-!data/raw/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
-!data/raw/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/**
-
-# Keep optional historical/testing folder if you use it
-!data/raw/sequence/
-!data/raw/sequence/**
-
-# Keep placeholder so folder structure can exist even when empty
-!data/raw/.gitkeep
-
-# ---- OTHER DATA BUCKETS (still ignored) ----
-data/interim/
-data/processed/
-data/derived/
-data/sample/derived/
-
-# NOTE:
-# We do NOT ignore data/sample/raw/ because you often want sample images committed for tests/demos.
-
-# ---- Outputs / artifacts (ignored) ----
-out/
-outputs/
-
-# If you DO want to keep some outputs, remove the out/ and outputs/ lines above,
-# and instead ignore only heavy image artifacts under them:
-out/**/*.png
-out/**/*.jpg
-out/**/*.jpeg
-outputs/**/*.png
-outputs/**/*.jpg
-outputs/**/*.jpeg
-
-# Model checkpoints
-*.pt
-*.pth
-*.onnx
-
-# Optional: videos/gifs
-*.mp4
-*.gif
+# allow artifacts
+!raw/**/*.png
+!raw/**/*.jpg
+!raw/**/*.jpeg
+!raw/**/*.csv
+!raw/**/*.json
