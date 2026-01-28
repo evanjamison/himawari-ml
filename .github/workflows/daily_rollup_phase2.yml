@@ -43,8 +43,12 @@ jobs:
           git fetch origin main --depth=1
           # Pull only code + deps files needed to run python scripts
           git checkout origin/main -- src scripts requirements.txt pyproject.toml || true
+
           echo "---- verify filter_black_frames.py exists ----"
           ls -la scripts/pipeline/filter_black_frames.py
+
+          echo "---- verify Phase 3 runner exists ----"
+          ls -la scripts/pipeline/run_phase3_unet_daily.py
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -106,12 +110,16 @@ jobs:
           OUTFRAMES="$OUTMASTER/frames"
           OUTDIR="out/$DAY/daily"
 
+          # ✅ Phase 3 outputs live here
+          PHASE3_OUT="out/$DAY/phase3_unet"
+
           echo "day=$DAY" >> "$GITHUB_OUTPUT"
           echo "daydir=$DAYDIR" >> "$GITHUB_OUTPUT"
           echo "inroot=$INROOT" >> "$GITHUB_OUTPUT"
           echo "outmaster=$OUTMASTER" >> "$GITHUB_OUTPUT"
           echo "outframes=$OUTFRAMES" >> "$GITHUB_OUTPUT"
           echo "outdir=$OUTDIR" >> "$GITHUB_OUTPUT"
+          echo "phase3_out=$PHASE3_OUT" >> "$GITHUB_OUTPUT"
 
       - name: Debug resolved paths
         shell: bash
@@ -123,6 +131,7 @@ jobs:
           echo "OUTMASTER=${{ steps.resolve.outputs.outmaster }}"
           echo "OUTFRAMES=${{ steps.resolve.outputs.outframes }}"
           echo "OUTDIR=${{ steps.resolve.outputs.outdir }}"
+          echo "PHASE3_OUT=${{ steps.resolve.outputs.phase3_out }}"
           echo "---- INROOT listing ----"
           ls -la "${{ steps.resolve.outputs.inroot }}" | head -n 80 || true
 
@@ -189,10 +198,51 @@ jobs:
             --outdir "${{ steps.resolve.outputs.outdir }}" \
             --save-overlays
 
+      # ----------------------------
+      # ✅ Phase 3: U-Net inference
+      # ----------------------------
+      - name: Run Phase 3 (U-Net inference)
+        shell: bash
+        env:
+          # Put your model on the data branch at this stable path
+          MODEL_PATH: out/models/unet_cloudmask_latest.pt
+        run: |
+          set -euo pipefail
+
+          DAY="${{ steps.resolve.outputs.day }}"
+          FRAMES="${{ steps.resolve.outputs.outframes }}"
+          OUTP3="${{ steps.resolve.outputs.phase3_out }}"
+
+          if [[ ! -f "$MODEL_PATH" ]]; then
+            echo "ERROR: MODEL_PATH not found: $MODEL_PATH"
+            echo "Fix: commit your model to data branch at out/models/unet_cloudmask_latest.pt"
+            ls -la out/models || true
+            exit 1
+          fi
+
+          mkdir -p "$OUTP3"
+
+          python scripts/pipeline/run_phase3_unet_daily.py \
+            --day "$DAY" \
+            --frames-dir "$FRAMES" \
+            --model "$MODEL_PATH" \
+            --outdir "$OUTP3"
+
+          echo "---- Phase 3 outputs ----"
+          find "$OUTP3" -maxdepth 3 -type f | head -n 120 || true
+
+      # Optional but very useful: download from Actions UI even if you don't commit outputs
+      - name: Upload Phase 3 outputs (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase3_unet_${{ steps.resolve.outputs.day }}
+          path: ${{ steps.resolve.outputs.phase3_out }}
+          if-no-files-found: warn
+
       - name: Commit results to data
         shell: bash
         run: |
           set -euo pipefail
           git add -f data/raw out || true
-          git commit -m "daily rollup + phase2: ${{ steps.resolve.outputs.day }}" || echo "No changes"
+          git commit -m "daily rollup + phase2 + phase3: ${{ steps.resolve.outputs.day }}" || echo "No changes"
           git push origin data
