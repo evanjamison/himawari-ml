@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -24,11 +24,10 @@ while not (REPO_ROOT / "pyproject.toml").exists() and not (REPO_ROOT / ".git").e
 
 
 # -------------------------
-# Model: "enc*/dec*/bottleneck" naming (matches your ckpt)
+# Blocks (match checkpoint BN key patterns like enc2.4.running_mean)
 # -------------------------
-def _double_conv(in_ch: int, out_ch: int) -> nn.Sequential:
-    # indices: 0 conv, 1 bn, 2 relu, 3 conv, 4 bn, 5 relu
-    # (matches keys like enc2.4.running_mean)
+def double_conv(in_ch: int, out_ch: int) -> nn.Sequential:
+    # 0 conv, 1 bn, 2 relu, 3 conv, 4 bn, 5 relu
     return nn.Sequential(
         nn.Conv2d(in_ch, out_ch, 3, padding=1),
         nn.BatchNorm2d(out_ch),
@@ -39,32 +38,90 @@ def _double_conv(in_ch: int, out_ch: int) -> nn.Sequential:
     )
 
 
-class UNetEncDec(nn.Module):
-    def __init__(self, in_ch: int = 3, base: int = 16, out_ch: int = 1):
+def concat_with_pad(x_up: torch.Tensor, x_skip: torch.Tensor) -> torch.Tensor:
+    diffY = x_skip.size(2) - x_up.size(2)
+    diffX = x_skip.size(3) - x_up.size(3)
+    x_up = F.pad(x_up, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+    return torch.cat([x_skip, x_up], dim=1)
+
+
+# -------------------------
+# 3-level U-Net (enc1-enc3, bottleneck, up1-up3, dec1-dec3, head)
+# This matches your ckpt: no enc4/dec4/up4, and uses head.*
+# -------------------------
+class UNet3(nn.Module):
+    def __init__(self, in_ch: int, base: int, out_ch: int = 1):
         super().__init__()
-
-        self.enc1 = _double_conv(in_ch, base)
-        self.enc2 = _double_conv(base, base * 2)
-        self.enc3 = _double_conv(base * 2, base * 4)
-        self.enc4 = _double_conv(base * 4, base * 8)
-
         self.pool = nn.MaxPool2d(2)
 
-        self.bottleneck = _double_conv(base * 8, base * 16)
+        self.enc1 = double_conv(in_ch, base)         # 32
+        self.enc2 = double_conv(base, base * 2)      # 64
+        self.enc3 = double_conv(base * 2, base * 4)  # 128
 
-        self.up4 = nn.ConvTranspose2d(base * 16, base * 8, kernel_size=2, stride=2)
-        self.dec4 = _double_conv(base * 16, base * 8)
+        self.bottleneck = double_conv(base * 4, base * 8)  # 256
 
-        self.up3 = nn.ConvTranspose2d(base * 8, base * 4, kernel_size=2, stride=2)
-        self.dec3 = _double_conv(base * 8, base * 4)
+        self.up3 = nn.ConvTranspose2d(base * 8, base * 4, 2, 2)
+        self.dec3 = double_conv(base * 8, base * 4)
 
-        self.up2 = nn.ConvTranspose2d(base * 4, base * 2, kernel_size=2, stride=2)
-        self.dec2 = _double_conv(base * 4, base * 2)
+        self.up2 = nn.ConvTranspose2d(base * 4, base * 2, 2, 2)
+        self.dec2 = double_conv(base * 4, base * 2)
 
-        self.up1 = nn.ConvTranspose2d(base * 2, base, kernel_size=2, stride=2)
-        self.dec1 = _double_conv(base * 2, base)
+        self.up1 = nn.ConvTranspose2d(base * 2, base, 2, 2)
+        self.dec1 = double_conv(base * 2, base)
 
-        self.final = nn.Conv2d(base, out_ch, kernel_size=1)
+        # checkpoint uses head.weight/head.bias
+        self.head = nn.Conv2d(base, out_ch, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+
+        b = self.bottleneck(self.pool(e3))
+
+        d3 = self.up3(b)
+        d3 = concat_with_pad(d3, e3)
+        d3 = self.dec3(d3)
+
+        d2 = self.up2(d3)
+        d2 = concat_with_pad(d2, e2)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)
+        d1 = concat_with_pad(d1, e1)
+        d1 = self.dec1(d1)
+
+        return self.head(d1)
+
+
+# -------------------------
+# 4-level U-Net (in case you later switch checkpoints)
+# -------------------------
+class UNet4(nn.Module):
+    def __init__(self, in_ch: int, base: int, out_ch: int = 1):
+        super().__init__()
+        self.pool = nn.MaxPool2d(2)
+
+        self.enc1 = double_conv(in_ch, base)
+        self.enc2 = double_conv(base, base * 2)
+        self.enc3 = double_conv(base * 2, base * 4)
+        self.enc4 = double_conv(base * 4, base * 8)
+
+        self.bottleneck = double_conv(base * 8, base * 16)
+
+        self.up4 = nn.ConvTranspose2d(base * 16, base * 8, 2, 2)
+        self.dec4 = double_conv(base * 16, base * 8)
+
+        self.up3 = nn.ConvTranspose2d(base * 8, base * 4, 2, 2)
+        self.dec3 = double_conv(base * 8, base * 4)
+
+        self.up2 = nn.ConvTranspose2d(base * 4, base * 2, 2, 2)
+        self.dec2 = double_conv(base * 4, base * 2)
+
+        self.up1 = nn.ConvTranspose2d(base * 2, base, 2, 2)
+        self.dec1 = double_conv(base * 2, base)
+
+        self.head = nn.Conv2d(base, out_ch, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         e1 = self.enc1(x)
@@ -75,29 +132,22 @@ class UNetEncDec(nn.Module):
         b = self.bottleneck(self.pool(e4))
 
         d4 = self.up4(b)
-        d4 = _concat_with_pad(d4, e4)
+        d4 = concat_with_pad(d4, e4)
         d4 = self.dec4(d4)
 
         d3 = self.up3(d4)
-        d3 = _concat_with_pad(d3, e3)
+        d3 = concat_with_pad(d3, e3)
         d3 = self.dec3(d3)
 
         d2 = self.up2(d3)
-        d2 = _concat_with_pad(d2, e2)
+        d2 = concat_with_pad(d2, e2)
         d2 = self.dec2(d2)
 
         d1 = self.up1(d2)
-        d1 = _concat_with_pad(d1, e1)
+        d1 = concat_with_pad(d1, e1)
         d1 = self.dec1(d1)
 
-        return self.final(d1)
-
-
-def _concat_with_pad(x_up: torch.Tensor, x_skip: torch.Tensor) -> torch.Tensor:
-    diffY = x_skip.size(2) - x_up.size(2)
-    diffX = x_skip.size(3) - x_up.size(3)
-    x_up = F.pad(x_up, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
-    return torch.cat([x_skip, x_up], dim=1)
+        return self.head(d1)
 
 
 # -------------------------
@@ -105,8 +155,14 @@ def _concat_with_pad(x_up: torch.Tensor, x_skip: torch.Tensor) -> torch.Tensor:
 # -------------------------
 def load_rgb(p: Path, image_size: int) -> np.ndarray:
     im = Image.open(p).convert("RGB")
+
+    # Pillow compatibility (older versions lack Image.Resampling)
+    Resampling = getattr(Image, "Resampling", None)
+    bilinear = Resampling.BILINEAR if Resampling is not None else Image.BILINEAR
+
     if im.size != (image_size, image_size):
-        im = im.resize((image_size, image_size), resample=Image.Resampling.BILINEAR)
+        im = im.resize((image_size, image_size), resample=bilinear)
+
     arr = np.asarray(im, dtype=np.float32) / 255.0
     arr = np.transpose(arr, (2, 0, 1))  # CHW
     return arr
@@ -129,7 +185,7 @@ def to_repo_rel(p: Path) -> str:
 
 
 # -------------------------
-# Checkpoint utilities
+# Checkpoint loading
 # -------------------------
 def extract_state_dict(ckpt_obj) -> Dict[str, torch.Tensor]:
     if isinstance(ckpt_obj, dict):
@@ -147,36 +203,29 @@ def normalize_keys(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         if nk.startswith("module."):
             nk = nk[len("module.") :]
 
+        # common variants
+        nk = nk.replace("final", "head").replace("final_conv", "head")
+        nk = nk.replace("outc", "head")
+
         nk = nk.replace("upconv4", "up4").replace("upconv3", "up3").replace("upconv2", "up2").replace("upconv1", "up1")
         nk = nk.replace("up_conv4", "up4").replace("up_conv3", "up3").replace("up_conv2", "up2").replace("up_conv1", "up1")
-        nk = nk.replace("final_conv", "final")
 
         out[nk] = v
     return out
 
 
-def infer_base_ch_from_ckpt(sd: Dict[str, torch.Tensor]) -> Optional[int]:
+def infer_base_and_depth(sd: Dict[str, torch.Tensor]) -> Tuple[int, int]:
     """
-    Infer base channels from bottleneck first conv weight:
-      bottleneck.0.weight has shape [base*16, base*8, 3, 3]
-    So base = out_channels / 16.
+    base = out_channels of enc1.0.weight
+    depth = 4 if enc4.0.weight exists else 3
     """
-    w = sd.get("bottleneck.0.weight")
+    w = sd.get("enc1.0.weight")
     if w is None:
-        return None
-    out_ch = int(w.shape[0])
-    if out_ch % 16 != 0:
-        return None
-    base = out_ch // 16
-    # sanity: common values 16/32/64
-    if base <= 0:
-        return None
-    return base
+        raise RuntimeError("Cannot infer base channels: missing enc1.0.weight in checkpoint")
+    base = int(w.shape[0])
 
-
-def load_model_weights(model: nn.Module, sd: Dict[str, torch.Tensor]) -> None:
-    # strict load should succeed now that base matches
-    model.load_state_dict(sd, strict=True)
+    depth = 4 if "enc4.0.weight" in sd else 3
+    return base, depth
 
 
 # -------------------------
@@ -187,18 +236,14 @@ def main() -> int:
 
     ap.add_argument("--frames", default="", help="Directory containing input frames/images")
     ap.add_argument("--recursive", action="store_true", help="Recursively search --frames directory")
-
     ap.add_argument("--metrics-csv", default="", help="CSV with 'relpath' (optionally 'img_ok'). If set, uses this mode.")
 
     ap.add_argument("--ckpt", required=True, help="Path to trained .pt checkpoint")
     ap.add_argument("--outdir", required=True, help="Output directory for Phase 3 artifacts")
     ap.add_argument("--image-size", type=int, default=256)
-
-    # If you pass --base-ch we will honor it; otherwise we auto-detect from ckpt.
-    ap.add_argument("--base-ch", type=int, default=0, help="UNet base channels (0 = auto from checkpoint)")
-
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--device", default="", help="cpu|cuda (default auto)")
+
     args = ap.parse_args()
 
     metrics_csv = str(args.metrics_csv).strip()
@@ -211,10 +256,9 @@ def main() -> int:
     out_masks = out_root / "masks_unet"
     out_masks.mkdir(parents=True, exist_ok=True)
 
-    # Device
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load checkpoint first (so we can infer base channels)
+    # Load checkpoint first, infer architecture
     ckpt_path = Path(args.ckpt)
     if not ckpt_path.is_absolute():
         ckpt_path = (REPO_ROOT / ckpt_path).resolve()
@@ -223,13 +267,7 @@ def main() -> int:
 
     ckpt_obj = torch.load(ckpt_path, map_location=device)
     sd = normalize_keys(extract_state_dict(ckpt_obj))
-
-    base_ch = int(args.base_ch)
-    if base_ch <= 0:
-        inferred = infer_base_ch_from_ckpt(sd)
-        if inferred is None:
-            raise SystemExit("ERROR: Could not auto-infer --base-ch from checkpoint. Please pass --base-ch explicitly.")
-        base_ch = inferred
+    base, depth = infer_base_and_depth(sd)
 
     # Collect images + build df
     if metrics_csv:
@@ -242,7 +280,6 @@ def main() -> int:
         df = pd.read_csv(mp)
         if "relpath" not in df.columns:
             raise SystemExit("ERROR: metrics CSV must include 'relpath' column")
-
         if "img_ok" in df.columns:
             df = df[df["img_ok"] == 1].copy()
 
@@ -253,8 +290,6 @@ def main() -> int:
             p = Path(rp)
             if not p.is_absolute():
                 p = (REPO_ROOT / p).resolve()
-            else:
-                p = p.resolve()
             img_paths.append(p)
     else:
         frames_dir = Path(frames_arg).expanduser()
@@ -266,12 +301,16 @@ def main() -> int:
         img_paths = iter_images(frames_dir, bool(args.recursive))
         if not img_paths:
             raise SystemExit(f"ERROR: No images found in {frames_dir} (recursive={bool(args.recursive)})")
-
         df = pd.DataFrame({"relpath": [to_repo_rel(p) for p in img_paths]})
 
-    # Build model with correct base, then load weights
-    model = UNetEncDec(in_ch=3, base=base_ch, out_ch=1).to(device)
-    load_model_weights(model, sd)
+    # Build model that matches ckpt
+    if depth == 3:
+        model = UNet3(in_ch=3, base=base, out_ch=1).to(device)
+    else:
+        model = UNet4(in_ch=3, base=base, out_ch=1).to(device)
+
+    # Strict load SHOULD succeed now
+    model.load_state_dict(sd, strict=True)
     model.eval()
 
     # Inference
@@ -302,7 +341,7 @@ def main() -> int:
     out_csv = out_root / "cloud_metrics_unet.csv"
     df.to_csv(out_csv, index=False)
 
-    print(f"Auto base-ch: {base_ch}")
+    print(f"Loaded checkpoint with base={base}, depth={depth}")
     print(f"Wrote: {out_csv}")
     print(f"Wrote masks: {out_masks}")
     return 0
@@ -311,6 +350,3 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
