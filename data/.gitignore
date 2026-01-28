@@ -1,16 +1,19 @@
-# Allow tracking of raw data in data branch
+# data branch: allow tracking raw imagery and outputs
+
+# re-include directories so git traverses them
 !raw/
 !raw/**
 
-# Allow images
+!interim/
+!interim/**
+!processed/
+!processed/**
+!derived/
+!derived/**
+
+# allow common artifacts
 !raw/**/*.png
 !raw/**/*.jpg
 !raw/**/*.jpeg
-
-# Allow outputs
-!interim/
-!processed/
-!derived/
-
-# Allow out/ artifacts
-!../out/**
+!raw/**/*.csv
+!raw/**/*.json
