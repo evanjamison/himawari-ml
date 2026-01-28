@@ -17,6 +17,15 @@ def run(cmd: list[str]) -> None:
     subprocess.check_call(cmd)
 
 
+def find_repo_root(start: Path) -> Path:
+    p = start.resolve()
+    while p != p.parent:
+        if (p / ".git").exists() or (p / "pyproject.toml").exists():
+            return p
+        p = p.parent
+    return start.resolve()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Phase 3: run U-Net inference on daily master frames.")
     ap.add_argument("--day", default=None, help="UTC day YYYY-MM-DD (default: yesterday).")
@@ -26,12 +35,7 @@ def main() -> int:
     ap.add_argument("--device", default=None, help="cpu|cuda (default: auto)")
     args = ap.parse_args()
 
-    # repo root = walk up until .git or pyproject.toml
-    repo = Path(__file__).resolve()
-    while not (repo / ".git").exists() and not (repo / "pyproject.toml").exists():
-        if repo == repo.parent:
-            break
-        repo = repo.parent
+    repo = find_repo_root(Path(__file__))
 
     day = args.day or yday_utc()
 
@@ -39,35 +43,70 @@ def main() -> int:
     if not frames_dir.exists():
         raise SystemExit(f"Missing frames_dir: {frames_dir} (run daily rollup first)")
 
-    ckpt = (repo / args.checkpoint).resolve() if not Path(args.checkpoint).is_absolute() else Path(args.checkpoint)
+    ckpt = Path(args.checkpoint)
+    if not ckpt.is_absolute():
+        ckpt = (repo / ckpt).resolve()
     if not ckpt.exists():
         raise SystemExit(f"Missing checkpoint: {ckpt}")
 
     outdir = repo / f"out/{day}/phase3_unet"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # ✅ Call the script by PATH (works in Actions)
-    infer_py = repo / "ml" / "infer_unet.py"
-    if not infer_py.exists():
-        raise SystemExit(f"Missing infer script: {infer_py}")
-
-    cmd = [
-        sys.executable,
-        str(infer_py),
-        "--frames",
-        str(frames_dir),
-        "--outdir",
-        str(outdir),
-        "--checkpoint",
-        str(ckpt),
-        "--recursive",
-        "--threshold",
-        str(args.threshold),
-        "--size",
-        str(args.size),
+    # ✅ Robust infer script detection (handles both infer_unet.py and infer_unet_masks.py)
+    candidates = [
+        repo / "ml" / "infer_unet.py",
+        repo / "ml" / "infer_unet_masks.py",
+        repo / "ml" / "scripts" / "infer_unet.py",
+        repo / "ml" / "scripts" / "infer_unet_masks.py",
     ]
-    if args.device:
-        cmd += ["--device", args.device]
+    infer_py = next((p for p in candidates if p.exists()), None)
+    if infer_py is None:
+        raise SystemExit(
+            "Missing infer script. Expected one of:\n"
+            + "\n".join([f"  - {p}" for p in candidates])
+        )
+
+    print(f"Using infer script: {infer_py}")
+
+    # Build command depending on which script we found
+    if infer_py.name == "infer_unet_masks.py":
+        # infer_unet_masks.py expects --ckpt and often uses --image-size
+        cmd = [
+            sys.executable,
+            str(infer_py),
+            "--frames",
+            str(frames_dir),
+            "--outdir",
+            str(outdir),
+            "--ckpt",
+            str(ckpt),
+            "--recursive",
+            "--threshold",
+            str(args.threshold),
+            "--image-size",
+            str(args.size),
+        ]
+        if args.device:
+            cmd += ["--device", args.device]
+    else:
+        # infer_unet.py expects --checkpoint and uses --size
+        cmd = [
+            sys.executable,
+            str(infer_py),
+            "--frames",
+            str(frames_dir),
+            "--outdir",
+            str(outdir),
+            "--checkpoint",
+            str(ckpt),
+            "--recursive",
+            "--threshold",
+            str(args.threshold),
+            "--size",
+            str(args.size),
+        ]
+        if args.device:
+            cmd += ["--device", args.device]
 
     run(cmd)
     print(f"✅ Phase 3 complete -> {outdir}")
