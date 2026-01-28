@@ -35,7 +35,7 @@ jobs:
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@users.noreply.github.com"
 
-      # ✅ Bring code from main into this workspace WITHOUT merging branches
+      # Bring code from main into this workspace WITHOUT merging branches
       - name: Bring pipeline code from main (no merge)
         shell: bash
         run: |
@@ -116,19 +116,6 @@ jobs:
           echo "outframes=$OUTFRAMES" >> "$GITHUB_OUTPUT"
           echo "outdir=$OUTDIR" >> "$GITHUB_OUTPUT"
 
-      - name: Debug resolved paths
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "DAY=${{ steps.resolve.outputs.day }}"
-          echo "DAYDIR=${{ steps.resolve.outputs.daydir }}"
-          echo "INROOT=${{ steps.resolve.outputs.inroot }}"
-          echo "OUTMASTER=${{ steps.resolve.outputs.outmaster }}"
-          echo "OUTFRAMES=${{ steps.resolve.outputs.outframes }}"
-          echo "OUTDIR=${{ steps.resolve.outputs.outdir }}"
-          echo "---- INROOT listing ----"
-          ls -la "${{ steps.resolve.outputs.inroot }}" | head -n 80 || true
-
       - name: Filter black frames (pre-stage)
         id: filter
         shell: bash
@@ -193,7 +180,7 @@ jobs:
             --save-overlays
 
       # -------------------------
-      # ✅ Phase 3: U-Net inference
+      # Phase 3: U-Net inference
       # -------------------------
       - name: Resolve U-Net model checkpoint
         id: model
@@ -201,31 +188,27 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p out/models
-
-          # Preferred canonical path
           CANON="out/models/unet_cloudmask_latest.pt"
+
           if [[ -f "$CANON" ]]; then
             echo "model_path=$CANON" >> "$GITHUB_OUTPUT"
-            echo "Using canonical model: $CANON"
             exit 0
           fi
 
-          # Otherwise, choose newest unet_cloudmask*.pt (avoid accidentally picking convlstm*.pt)
-          CAND="$(ls -1t out/models/unet_cloudmask*.pt 2>/dev/null | head -n 1 || true)"
-          if [[ -z "$CAND" ]]; then
-            echo "ERROR: No U-Net checkpoint found."
-            echo "Expected either:"
-            echo "  - out/models/unet_cloudmask_latest.pt"
-            echo "  - out/models/unet_cloudmask*.pt"
-            echo ""
-            echo "Fix: commit/copy your U-Net model onto the data branch under out/models/"
-            ls -la out/models || true
+          echo "MODEL_CANDIDATE missing: $CANON"
+          echo "Searching for any *.pt under out/models (top 20 newest)..."
+          mkdir -p out/models
+
+          mapfile -t CANDS < <(find out/models -type f -name "*.pt" -printf "%T@|%p\n" | sort -nr | head -n 20 | cut -d'|' -f2-)
+          printf '%s\n' "${CANDS[@]}" || true
+
+          if [[ ${#CANDS[@]} -eq 0 ]]; then
+            echo "ERROR: No model .pt found under out/models in this checkout."
+            echo "Fix: commit your trained model to the DATA branch at: out/models/unet_cloudmask_latest.pt"
             exit 1
           fi
 
-          echo "model_path=$CAND" >> "$GITHUB_OUTPUT"
-          echo "Using newest candidate: $CAND"
+          echo "model_path=${CANDS[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Run Phase 3 (U-Net inference)
         shell: bash
@@ -234,27 +217,18 @@ jobs:
 
           DAY="${{ steps.resolve.outputs.day }}"
           MODEL_PATH="${{ steps.model.outputs.model_path }}"
-          FRAMES_DIR="data/raw/$DAY/master/frames"
-          OUTDIR="out/$DAY/phase3_unet"
 
-          echo "DAY=$DAY"
-          echo "MODEL_PATH=$MODEL_PATH"
-          echo "FRAMES_DIR=$FRAMES_DIR"
-          echo "OUTDIR=$OUTDIR"
-
+          echo "Using DAY=$DAY"
+          echo "Using MODEL_PATH=$MODEL_PATH"
           ls -la "$MODEL_PATH" || true
-          ls -la "$FRAMES_DIR" | head -n 50 || true
 
-          # IMPORTANT: runner expects --image-size (not --size)
+          # ✅ NOTE: run_phase3_unet_daily.py expects --size (NOT --image-size)
           python scripts/pipeline/run_phase3_unet_daily.py \
             --day "$DAY" \
             --checkpoint "$MODEL_PATH" \
             --threshold 0.5 \
-            --image-size 256 \
+            --size 256 \
             --device cpu
-
-          echo "---- Phase3 outputs ----"
-          find "$OUTDIR" -maxdepth 2 -type f | head -n 80 || true
 
       - name: Upload Phase 3 outputs (artifact)
         uses: actions/upload-artifact@v4
@@ -269,5 +243,3 @@ jobs:
           git add -f data/raw out || true
           git commit -m "daily rollup + phase2 + phase3: ${{ steps.resolve.outputs.day }}" || echo "No changes"
           git push origin data
-
-
