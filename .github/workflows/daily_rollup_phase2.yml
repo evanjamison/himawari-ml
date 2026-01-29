@@ -241,6 +241,7 @@ jobs:
             --recursive \
             --threshold 0.3 \
             --image-size 256 \
+            --grayscale \
             --device cpu
 
           echo "---- debug: check masks_not_empty (white pixel %) ----"
