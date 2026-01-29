@@ -194,7 +194,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          CANON="out/models/unet_cloudmask_20260129T021416Z.pt"
+          CANON="out/models/unet_cloudmask_latest.pt"
           if [[ -f "$CANON" ]]; then
             echo "model_path=$CANON" >> "$GITHUB_OUTPUT"
             echo "Using canonical: $CANON"
