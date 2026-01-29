@@ -183,11 +183,12 @@ jobs:
             --save-overlays
 
       # -------------------------
-      # Phase 3: U-Net inference (MATCH YOUR LOCAL RUN)
-      # Uses: ml/infer_unet_masks.py
+      # Phase 3: U-Net inference (MATCH LOCAL BEHAVIOR)
+      # We create grayscale copies of frames before running ml/infer_unet_masks.py
       # Threshold: 0.3
       # Output: out/$DAY/phase3_unet_v2_thr03
       # -------------------------
+
       - name: Resolve U-Net model checkpoint
         id: model
         shell: bash
@@ -214,34 +215,76 @@ jobs:
           echo "model_path=${CANDS[0]}" >> "$GITHUB_OUTPUT"
           echo "Using newest: ${CANDS[0]}"
 
-      - name: Run Phase 3 (U-Net inference) using ml/infer_unet_masks.py @ thr=0.3
-        id: phase3
+      - name: Phase 3 prep — create grayscale frames (to match local)
+        id: phase3_prep
         shell: bash
         run: |
           set -euo pipefail
 
           DAY="${{ steps.resolve.outputs.day }}"
           FRAMES="${{ steps.resolve.outputs.outframes }}"
+          GRAYDIR="out/${DAY}/phase3_unet_v2_thr03/frames_gray"
+
+          echo "DAY=$DAY"
+          echo "FRAMES=$FRAMES"
+          echo "GRAYDIR=$GRAYDIR"
+
+          mkdir -p "$GRAYDIR"
+
+          python - << 'PY'
+          from pathlib import Path
+          from PIL import Image
+
+          frames = Path(r"${{ steps.resolve.outputs.outframes }}")
+          graydir = Path(r"out/${{ steps.resolve.outputs.day }}/phase3_unet_v2_thr03/frames_gray")
+          graydir.mkdir(parents=True, exist_ok=True)
+
+          # copy/convert all pngs (flat folder) to grayscale "L"
+          files = sorted(frames.glob("*.png"))
+          print("Found frames:", len(files))
+
+          if not files:
+            raise SystemExit(f"ERROR: No PNGs in {frames}")
+
+          for f in files:
+            img = Image.open(f).convert("L")  # <- key: 1-channel grayscale
+            out = graydir / f.name
+            img.save(out)
+
+          # quick sanity: show one sample stats
+          import numpy as np
+          a = np.array(Image.open(graydir / files[0].name))
+          print("Sample gray:", files[0].name, "shape", a.shape, "min/max", int(a.min()), int(a.max()))
+          PY
+
+          echo "graydir=$GRAYDIR" >> "$GITHUB_OUTPUT"
+
+      - name: Run Phase 3 (U-Net inference) using ml/infer_unet_masks.py @ thr=0.3 (on grayscale frames)
+        id: phase3
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DAY="${{ steps.resolve.outputs.day }}"
+          FRAMES_GRAY="${{ steps.phase3_prep.outputs.graydir }}"
           MODEL_PATH="${{ steps.model.outputs.model_path }}"
           OUTDIR="out/${DAY}/phase3_unet_v2_thr03"
 
           echo "DAY=$DAY"
-          echo "FRAMES=$FRAMES"
+          echo "FRAMES_GRAY=$FRAMES_GRAY"
           echo "MODEL_PATH=$MODEL_PATH"
           echo "OUTDIR=$OUTDIR"
 
           ls -la "$MODEL_PATH" || true
           mkdir -p "$OUTDIR"
 
-          # ✅ THIS MATCHES YOUR WORKING LOCAL COMMAND
+          # This now feeds 1-channel (grayscale) images via PNGs saved in frames_gray
           python ml/infer_unet_masks.py \
-            --frames "$FRAMES" \
+            --frames "$FRAMES_GRAY" \
             --outdir "$OUTDIR" \
             --ckpt "$MODEL_PATH" \
-            --recursive \
             --threshold 0.3 \
             --image-size 256 \
-            --grayscale \
             --device cpu
 
           echo "---- debug: check masks_not_empty (white pixel %) ----"
@@ -254,7 +297,11 @@ jobs:
           files = sorted(p.glob("*.png"))
           print("masks_unet:", str(p))
           print("count:", len(files))
-          for f in files[:10]:
+
+          if not files:
+            raise SystemExit("ERROR: No masks written")
+
+          for f in files[:20]:
             a = np.array(Image.open(f))
             white = float((a > 0).mean()) * 100.0
             print(f.name, "shape", a.shape, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))
