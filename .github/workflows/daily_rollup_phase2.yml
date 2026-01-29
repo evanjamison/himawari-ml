@@ -259,6 +259,59 @@ jobs:
             print(f.name, "shape", a.shape, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))
           PY
 
+      # -------------------------
+      # TEMP DEBUG: Inspect Phase 3 inputs + model behavior
+      # (REMOVE after verification)
+      # -------------------------
+      - name: DEBUG Phase 3 — inspect frames + model outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - << 'PY'
+          import torch
+          import numpy as np
+          from pathlib import Path
+          from PIL import Image
+
+          frames = Path("${{ steps.resolve.outputs.outframes }}")
+          model_path = Path("out/models/unet_cloudmask_latest.pt")
+
+          print("DEBUG Phase 3")
+          print("Frames dir:", frames)
+          print("Model path:", model_path)
+          print("Model exists:", model_path.exists())
+
+          imgs = sorted(frames.glob("*.png"))
+          print("Frame count:", len(imgs))
+
+          if not imgs:
+              raise RuntimeError("No frames found for Phase 3 debug")
+
+          img = imgs[0]
+          print("Sample frame:", img.name)
+
+          im = np.array(Image.open(img).convert("RGB"), dtype=np.float32) / 255.0
+          x = torch.from_numpy(im).permute(2,0,1).unsqueeze(0)
+
+          print("Input tensor stats:")
+          print("  shape:", tuple(x.shape))
+          print("  min:", float(x.min()))
+          print("  max:", float(x.max()))
+          print("  mean:", float(x.mean()))
+
+          state = torch.load(model_path, map_location="cpu")
+          print("Checkpoint type:", type(state))
+
+          if isinstance(state, dict) and "state_dict" in state:
+              print("Checkpoint contains state_dict")
+
+          print("DEBUG COMPLETE")
+          PY
+
+
+
+
       - name: Upload Phase 3 outputs (artifact)
         uses: actions/upload-artifact@v4
         with:
@@ -272,4 +325,3 @@ jobs:
           git add -f data/raw out || true
           git commit -m "daily rollup + phase2 + phase3(thr=0.3): ${{ steps.resolve.outputs.day }}" || echo "No changes"
           git push origin data
-
