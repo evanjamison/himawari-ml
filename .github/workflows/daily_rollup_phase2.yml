@@ -194,10 +194,7 @@ jobs:
             --save-overlays
 
       # -------------------------
-      # Phase 3: U-Net inference (MATCH YOUR LOCAL RUN)
-      # Uses: ml/infer_unet_masks.py
-      # Threshold: 0.3
-      # Output: out/$DAY/phase3_unet_v2_thr03
+      # Phase 3: U-Net inference (auto-threshold)
       # -------------------------
       - name: Resolve U-Net model checkpoint
         id: model
@@ -218,13 +215,103 @@ jobs:
 
           if [[ ${#CANDS[@]} -eq 0 ]]; then
             echo "ERROR: No model .pt found under out/models in this checkout."
-            echo "Fix: commit a model to data branch at out/models/unet_cloudmask_latest.pt"
             exit 1
           fi
 
           echo "model_path=${CANDS[0]}" >> "$GITHUB_OUTPUT"
           echo "Using newest: ${CANDS[0]}"
 
+      - name: Pick a good threshold automatically (TEMP)
+        id: thr
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DAY="${{ steps.resolve.outputs.day }}"
+          FRAMES="${{ steps.resolve.outputs.outframes }}"
+          MODEL_PATH="${{ steps.model.outputs.model_path }}"
+
+          # Target average predicted cloud coverage (white%) on the masks.
+          # If you're getting "too white", LOWER this (e.g., 3.0). If "too black", RAISE (e.g., 12.0).
+          TARGET_WHITE_PCT="7.0"
+
+          echo "DAY=$DAY"
+          echo "FRAMES=$FRAMES"
+          echo "MODEL_PATH=$MODEL_PATH"
+          echo "TARGET_WHITE_PCT=$TARGET_WHITE_PCT"
+
+          python - << 'PY'
+          import os, random
+          from pathlib import Path
+          import numpy as np
+          import torch
+          from PIL import Image
+
+          day = os.environ["DAY"]
+          frames_dir = Path(os.environ["FRAMES"])
+          ckpt_path = Path(os.environ["MODEL_PATH"])
+          target = float(os.environ["TARGET_WHITE_PCT"])
+
+          # Import the same model builder your infer script uses
+          # (infer_unet_masks.py defines UNetSmall + load logic)
+          from ml.infer_unet_masks import UNetSmall  # type: ignore
+
+          ckpt = torch.load(str(ckpt_path), map_location="cpu")
+          state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+
+          # Infer base_ch/depth if present; otherwise default to what you trained with
+          base = int(ckpt.get("base_ch", 32)) if isinstance(ckpt, dict) else 32
+          depth = int(ckpt.get("depth", 3)) if isinstance(ckpt, dict) else 3
+
+          model = UNetSmall(in_channels=3, out_channels=1, base_ch=base, depth=depth)
+          model.load_state_dict(state, strict=False)
+          model.eval()
+
+          files = sorted(frames_dir.glob("*.png"))
+          if not files:
+            raise SystemExit(f"No frames found in {frames_dir}")
+
+          # sample up to 12 frames across the day
+          n = min(12, len(files))
+          idxs = np.linspace(0, len(files) - 1, n).astype(int).tolist()
+          sample = [files[i] for i in idxs]
+
+          # thresholds to test (covers both your extremes)
+          thresholds = [0.05, 0.07, 0.09, 0.10, 0.11, 0.12, 0.13, 0.15, 0.18, 0.22, 0.30]
+
+          def run_on_image(p: Path):
+            img = np.array(Image.open(p).convert("RGB")).astype(np.float32) / 255.0
+            x = torch.from_numpy(img).permute(2,0,1).unsqueeze(0)
+            with torch.no_grad():
+              logits = model(x)
+              prob = torch.sigmoid(logits).squeeze().cpu().numpy()
+            return prob
+
+          # compute mean white% per threshold over sample
+          table = []
+          for t in thresholds:
+            whites = []
+            for p in sample:
+              prob = run_on_image(p)
+              whites.append(float((prob > t).mean() * 100.0))
+            table.append((t, float(np.mean(whites)), float(np.std(whites))))
+          # pick threshold closest to target mean white%
+          best = min(table, key=lambda r: abs(r[1] - target))
+
+          print("---- threshold sweep (t, mean_white%, std) ----")
+          for t, m, s in table:
+            print(f"{t:>5}  mean={m:6.2f}%  std={s:6.2f}%")
+          print(f"\nCHOSEN_THRESHOLD={best[0]} (target {target}%, mean {best[1]:.2f}%)")
+
+          # write chosen threshold for Actions output
+          out = Path(os.environ["GITHUB_OUTPUT"])
+          out.write_text(out.read_text() + f"threshold={best[0]}\n")
+          PY
+        env:
+          DAY: ${{ steps.resolve.outputs.day }}
+          FRAMES: ${{ steps.resolve.outputs.outframes }}
+          MODEL_PATH: ${{ steps.model.outputs.model_path }}
+          
       # -------------------------
       # TEMP DEBUG (REMOVE AFTER FIXED)
       # Inspect model output distribution on 1 real frame using
@@ -290,7 +377,7 @@ jobs:
           print("DEBUG COMPLETE")
           PY
 
-      - name: Run Phase 3 (U-Net inference) using ml/infer_unet_masks.py @ thr=0.3
+      - name: Run Phase 3 (U-Net inference) using auto threshold
         id: phase3
         shell: bash
         run: |
@@ -299,44 +386,40 @@ jobs:
           DAY="${{ steps.resolve.outputs.day }}"
           FRAMES="${{ steps.resolve.outputs.outframes }}"
           MODEL_PATH="${{ steps.model.outputs.model_path }}"
-          OUTDIR="out/${DAY}/phase3_unet_v2_thr03"
+          THR="${{ steps.thr.outputs.threshold }}"
+          OUTDIR="out/${DAY}/phase3_unet_v2_auto"
 
           echo "DAY=$DAY"
           echo "FRAMES=$FRAMES"
           echo "MODEL_PATH=$MODEL_PATH"
+          echo "THR=$THR"
           echo "OUTDIR=$OUTDIR"
 
-          ls -la "$MODEL_PATH" || true
           mkdir -p "$OUTDIR"
 
-          # ✅ Matches your local command
           python ml/infer_unet_masks.py \
             --frames "$FRAMES" \
             --outdir "$OUTDIR" \
             --ckpt "$MODEL_PATH" \
             --recursive \
-            --threshold 0.15 \
+            --threshold "$THR" \
             --image-size 256 \
             --device cpu
 
-          echo "---- debug: check masks_not_empty (white pixel %) ----"
+          echo "---- quick mask sanity (first 10 white%) ----"
           python - << 'PY'
           from pathlib import Path
           import numpy as np
           from PIL import Image
 
-          p = Path("out") / Path(r"${{ steps.resolve.outputs.day }}") / "phase3_unet_v2_thr03" / "masks_unet"
+          p = Path("out") / "${{ steps.resolve.outputs.day }}" / "phase3_unet_v2_auto" / "masks_unet"
           files = sorted(p.glob("*.png"))
-          print("masks_unet:", str(p))
+          print("masks_unet:", p)
           print("count:", len(files))
-
-          if not files:
-            raise SystemExit("ERROR: No masks written")
-
-          for f in files[:25]:
+          for f in files[:10]:
             a = np.array(Image.open(f))
             white = float((a > 0).mean()) * 100.0
-            print(f.name, "shape", a.shape, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))
+            print(f.name, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))
           PY
 
       - name: Upload Phase 3 outputs (artifact)
