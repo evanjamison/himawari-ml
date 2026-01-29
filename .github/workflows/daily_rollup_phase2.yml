@@ -228,33 +228,50 @@ jobs:
           echo "---- list models ----"
           find out/models -type f -name "*.pt" -maxdepth 4 -print || true
 
-      - name: Phase 3C - Resolve trained checkpoint (newest) + set canonical latest
+      - name: Phase 3C - Resolve trained checkpoint from newest metrics (robust)
         id: model
         shell: bash
         run: |
           set -euo pipefail
 
-          # Your train script sometimes writes into out/models/models/...
-          mapfile -t CANDS < <(find out/models -type f -name "*.pt" -printf "%T@|%p\n" | sort -nr | cut -d'|' -f2-)
+          echo "---- after training, list recent artifacts ----"
+          find out/models -type f \( -name "*.pt" -o -name "*.metrics.csv" -o -name "*.config.json" \) -printf "%T@ %p\n" | sort -nr | head -n 30 || true
 
-          if [[ ${#CANDS[@]} -eq 0 ]]; then
-            echo "ERROR: No .pt files found under out/models after training."
-            ls -R out/models || true
+          # ✅ Find newest metrics file (this anchors us to the actual run)
+          METRICS="$(find out/models -type f -name "*.metrics.csv" -printf "%T@|%p\n" | sort -nr | head -n 1 | cut -d'|' -f2-)"
+
+          if [[ -z "${METRICS:-}" || ! -f "$METRICS" ]]; then
+            echo "ERROR: No *.metrics.csv found under out/models after training."
             exit 1
           fi
 
-          BEST="${CANDS[0]}"
-          echo "Newest checkpoint: $BEST"
-          ls -la "$BEST" || true
+          echo "Newest metrics: $METRICS"
+          STEM="${METRICS%.metrics.csv}"
+          PT="$STEM.pt"
 
+          if [[ ! -f "$PT" ]]; then
+            echo "ERROR: Expected checkpoint next to metrics but not found:"
+            echo "  expected: $PT"
+            echo "Searching for matching .pt by basename..."
+            BASE="$(basename "$STEM")"
+            MATCH="$(find out/models -type f -name "${BASE}.pt" | head -n 1 || true)"
+            [[ -n "$MATCH" ]] || { echo "ERROR: Could not find ${BASE}.pt anywhere under out/models"; exit 1; }
+            PT="$MATCH"
+          fi
+
+          echo "Using checkpoint: $PT"
+          ls -la "$PT" || true
+
+          # Optional: keep canonical latest for other workflows
           CANON="out/models/unet_cloudmask_latest.pt"
-          cp -f "$BEST" "$CANON"
+          cp -f "$PT" "$CANON"
           echo "Wrote canonical checkpoint: $CANON"
-          ls -la "$CANON"
+          ls -la "$CANON" || true
 
-          echo "model_path=$CANON" >> "$GITHUB_OUTPUT"
+          echo "model_path=$PT" >> "$GITHUB_OUTPUT"
+          echo "canon_path=$CANON" >> "$GITHUB_OUTPUT"
 
-      - name: Phase 3D - Infer masks (threshold 0.3)
+      - name: Phase 3D - Infer masks (threshold 0.3) + debug pixel stats
         shell: bash
         run: |
           set -euo pipefail
@@ -275,10 +292,31 @@ jobs:
             --image-size 256 \
             --device cpu
 
+          echo "---- debug: check masks not-empty (white pixel %) ----"
+          python - <<'PY'
+          from pathlib import Path
+          import numpy as np
+          from PIL import Image
+
+          outdir = Path("out") / "${{ steps.resolve.outputs.day }}" / "phase3_unet_v2_thr03" / "masks_unet"
+          files = sorted(outdir.glob("*.png"))
+          print("masks_unet:", outdir)
+          print("count:", len(files))
+          if not files:
+            raise SystemExit("No mask PNGs found.")
+
+          # sample first 5
+          for f in files[:5]:
+            a = np.array(Image.open(f))
+            white = (a >= 128).mean() * 100.0
+            print(f.name, "shape", a.shape, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))
+          PY
+
           echo "---- phase3 outputs ----"
           ls -la "$OUTDIR" || true
           ls -la "$OUTDIR/masks_unet" | head -n 20 || true
           ls -la "$OUTDIR/cloud_metrics_unet.csv" || true
+
 
       - name: Upload Phase 3 outputs (artifact)
         uses: actions/upload-artifact@v4
