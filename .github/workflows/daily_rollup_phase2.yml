@@ -46,8 +46,11 @@ jobs:
           echo "---- verify filter_black_frames.py exists ----"
           ls -la scripts/pipeline/filter_black_frames.py
 
-          echo "---- verify phase3 runner exists ----"
-          ls -la scripts/pipeline/run_phase3_unet_daily.py
+          echo "---- verify phase3 runner exists (optional) ----"
+          ls -la scripts/pipeline/run_phase3_unet_daily.py || true
+
+          echo "---- verify teacher baseline exists ----"
+          ls -la scripts/experiments/segmentation/cloud_mask_baseline_v2.py
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -61,6 +64,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -e .
+          # ✅ baseline v2 imports cv2; use headless OpenCV on GH runners
+          pip install opencv-python-headless
 
       - name: Resolve DAY + input roots
         id: resolve
@@ -179,67 +184,118 @@ jobs:
             --outdir "${{ steps.resolve.outputs.outdir }}" \
             --save-overlays
 
-      # -------------------------
-      # Phase 3: U-Net inference
-      # -------------------------
-      - name: Resolve U-Net model checkpoint
+      # ============================================================
+      # Phase 3 (v2): Teacher -> Train -> Infer  (matches your local)
+      # ============================================================
+
+      - name: Phase 3A - Build teacher masks + cloud_metrics.csv (baseline v2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAWDIR="${{ steps.resolve.outputs.outframes }}"
+
+          # Produces:
+          #   out/cloud_metrics.csv
+          #   out/masks/...
+          python scripts/experiments/segmentation/cloud_mask_baseline_v2.py \
+            --raw-dir "$RAWDIR" \
+            --outdir out \
+            --image-size 256 \
+            --save-overlays
+
+          echo "---- verify teacher outputs ----"
+          ls -la out/cloud_metrics.csv
+          ls -la out/masks | head -n 20 || true
+
+      - name: Phase 3B - Train U-Net on teacher metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Your local run:
+          # python ml/train_unet.py --metrics-csv out/cloud_metrics.csv --outdir out/models ...
+          python ml/train_unet.py \
+            --metrics-csv out/cloud_metrics.csv \
+            --outdir out/models \
+            --epochs 30 \
+            --batch-size 4 \
+            --lr 3e-4 \
+            --base-ch 32 \
+            --augment \
+            --bce-weight 0.2 \
+            --device cpu
+
+          echo "---- list models ----"
+          find out/models -type f -name "*.pt" -maxdepth 4 -print || true
+
+      - name: Phase 3C - Resolve trained checkpoint (newest) + set canonical latest
         id: model
         shell: bash
         run: |
           set -euo pipefail
 
-          CANON="out/models/unet_cloudmask_latest.pt"
-
-          if [[ -f "$CANON" ]]; then
-            echo "model_path=$CANON" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "MODEL_CANDIDATE missing: $CANON"
-          echo "Searching for any *.pt under out/models (top 20 newest)..."
-          mkdir -p out/models
-
-          mapfile -t CANDS < <(find out/models -type f -name "*.pt" -printf "%T@|%p\n" | sort -nr | head -n 20 | cut -d'|' -f2-)
-          printf '%s\n' "${CANDS[@]}" || true
+          # Your train script sometimes writes into out/models/models/...
+          mapfile -t CANDS < <(find out/models -type f -name "*.pt" -printf "%T@|%p\n" | sort -nr | cut -d'|' -f2-)
 
           if [[ ${#CANDS[@]} -eq 0 ]]; then
-            echo "ERROR: No model .pt found under out/models in this checkout."
-            echo "Fix: commit your trained model to the DATA branch at: out/models/unet_cloudmask_latest.pt"
+            echo "ERROR: No .pt files found under out/models after training."
+            ls -R out/models || true
             exit 1
           fi
 
-          echo "model_path=${CANDS[0]}" >> "$GITHUB_OUTPUT"
+          BEST="${CANDS[0]}"
+          echo "Newest checkpoint: $BEST"
+          ls -la "$BEST" || true
 
-      - name: Run Phase 3 (U-Net inference)
+          CANON="out/models/unet_cloudmask_latest.pt"
+          cp -f "$BEST" "$CANON"
+          echo "Wrote canonical checkpoint: $CANON"
+          ls -la "$CANON"
+
+          echo "model_path=$CANON" >> "$GITHUB_OUTPUT"
+
+      - name: Phase 3D - Infer masks (threshold 0.3)
         shell: bash
         run: |
           set -euo pipefail
 
           DAY="${{ steps.resolve.outputs.day }}"
+          RAWDIR="${{ steps.resolve.outputs.outframes }}"
           MODEL_PATH="${{ steps.model.outputs.model_path }}"
 
-          echo "Using DAY=$DAY"
-          echo "Using MODEL_PATH=$MODEL_PATH"
-          ls -la "$MODEL_PATH" || true
+          OUTDIR="out/$DAY/phase3_unet_v2_thr03"
+          mkdir -p "$OUTDIR"
 
-          # ✅ NOTE: run_phase3_unet_daily.py expects --size (NOT --image-size)
-          python scripts/pipeline/run_phase3_unet_daily.py \
-            --day "$DAY" \
-            --checkpoint "$MODEL_PATH" \
-            --threshold 0.5 \
-            --size 256 \
+          python ml/infer_unet_masks.py \
+            --frames "$RAWDIR" \
+            --outdir "$OUTDIR" \
+            --ckpt "$MODEL_PATH" \
+            --recursive \
+            --threshold 0.3 \
+            --image-size 256 \
             --device cpu
+
+          echo "---- phase3 outputs ----"
+          ls -la "$OUTDIR" || true
+          ls -la "$OUTDIR/masks_unet" | head -n 20 || true
+          ls -la "$OUTDIR/cloud_metrics_unet.csv" || true
 
       - name: Upload Phase 3 outputs (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: phase3_unet_${{ steps.resolve.outputs.day }}
-          path: out/${{ steps.resolve.outputs.day }}/phase3_unet
+          name: phase3_unet_v2_${{ steps.resolve.outputs.day }}
+          path: |
+            out/${{ steps.resolve.outputs.day }}/phase3_unet_v2_thr03
+            out/cloud_metrics.csv
+            out/masks
+            out/models/unet_cloudmask_latest.pt
 
       - name: Commit results to data
         shell: bash
         run: |
           set -euo pipefail
+          DAY="${{ steps.resolve.outputs.day }}"
+
           git add -f data/raw out || true
-          git commit -m "daily rollup + phase2 + phase3: ${{ steps.resolve.outputs.day }}" || echo "No changes"
+          git commit -m "daily rollup + phase2 + phase3(v2 teacher->train->infer): $DAY" || echo "No changes"
           git push origin data
