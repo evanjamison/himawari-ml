@@ -315,7 +315,7 @@ jobs:
             --outdir "$OUTDIR" \
             --ckpt "$MODEL_PATH" \
             --recursive \
-            --threshold 0.3 \
+            --threshold 0.05 \
             --image-size 256 \
             --device cpu
 
