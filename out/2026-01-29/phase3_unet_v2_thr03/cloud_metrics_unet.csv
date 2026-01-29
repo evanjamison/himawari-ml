@@ -130,3 +130,9 @@ data/raw/2026-01-29/master/frames/himawari_20260129T183000Z.png,out/2026-01-29/p
 data/raw/2026-01-29/master/frames/himawari_20260129T184000Z.png,out/2026-01-29/phase3_unet_v2_thr03/masks_unet/himawari_20260129T184000Z_mask.png,0.0
 data/raw/2026-01-29/master/frames/himawari_20260129T185000Z.png,out/2026-01-29/phase3_unet_v2_thr03/masks_unet/himawari_20260129T185000Z_mask.png,0.0
 data/raw/2026-01-29/master/frames/himawari_20260129T190000Z.png,out/2026-01-29/phase3_unet_v2_thr03/masks_unet/himawari_20260129T190000Z_mask.png,0.0
+data/raw/2026-01-29/master/frames/himawari_20260129T191000Z.png,out/2026-01-29/phase3_unet_v2_thr03/masks_unet/himawari_20260129T191000Z_mask.png,0.0
+data/raw/2026-01-29/master/frames/himawari_20260129T192000Z.png,out/2026-01-29/phase3_unet_v2_thr03/masks_unet/himawari_20260129T192000Z_mask.png,0.0
+data/raw/2026-01-29/master/frames/himawari_20260129T193000Z.png,out/2026-01-29/phase3_unet_v2_thr03/masks_unet/himawari_20260129T193000Z_mask.png,0.0
+data/raw/2026-01-29/master/frames/himawari_20260129T194000Z.png,out/2026-01-29/phase3_unet_v2_thr03/masks_unet/himawari_20260129T194000Z_mask.png,0.0
+data/raw/2026-01-29/master/frames/himawari_20260129T195000Z.png,out/2026-01-29/phase3_unet_v2_thr03/masks_unet/himawari_20260129T195000Z_mask.png,0.0
+data/raw/2026-01-29/master/frames/himawari_20260129T200000Z.png,out/2026-01-29/phase3_unet_v2_thr03/masks_unet/himawari_20260129T200000Z_mask.png,0.0
