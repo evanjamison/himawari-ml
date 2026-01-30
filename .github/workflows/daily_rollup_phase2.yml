@@ -295,6 +295,23 @@ jobs:
           echo "model_path=$PT" >> "$GITHUB_OUTPUT"
           echo "canon_path=$CANON" >> "$GITHUB_OUTPUT"
 
+          - name: Debug checkpoint identity
+          shell: bash
+          run: |
+            ls -lh out/models
+            python - <<'PY'
+            import torch
+            p = "out/models/unet_cloudmask_latest.pt"
+            print("exists:", p)
+            ckpt = torch.load(p, map_location="cpu")
+            print("ckpt type:", type(ckpt))
+            if isinstance(ckpt, dict):
+                print("run_id:", ckpt.get("config", {}).get("run_id"))
+                print("use_disk_mask:", ckpt.get("config", {}).get("use_disk_mask"))
+                print("pos_weight:", ckpt.get("config", {}).get("pos_weight"))
+            PY
+
+
       - name: Phase 3D - Infer masks (threshold 0.3) + debug pixel stats
         shell: bash
         run: |
