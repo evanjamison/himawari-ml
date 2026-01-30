@@ -243,6 +243,14 @@ jobs:
 
           echo "---- list models ----"
           find out/models -type f -name "*.pt" -maxdepth 4 -print || true
+          python - <<'PY'
+          import torch
+          ckpt = torch.load("out/models/unet_cloudmask_latest.pt", map_location="cpu")
+          print("using run_id:", ckpt.get("config", {}).get("run_id", None))
+          print("pos_weight:", ckpt.get("config", {}).get("pos_weight", None))
+          print("use_disk_mask:", ckpt.get("config", {}).get("use_disk_mask", None))
+          PY
+
 
       - name: Phase 3C - Resolve trained checkpoint from newest metrics (robust)
         id: model
