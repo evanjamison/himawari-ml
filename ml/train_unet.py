@@ -634,6 +634,16 @@ def main() -> int:
                 best_path,
             )
 
+    print(
+    "[TRAIN] saved checkpoint:",
+    out_ckpt,
+    "run_id:", run_id,
+    "use_disk_mask:", args.use_disk_mask,
+    "pos_weight:", pos_weight,
+    "bce_weight:", args.bce_weight,
+    )
+
+
     hist = pd.DataFrame(history)
     hist.to_csv(metrics_path, index=False)
     save_training_curves(hist, curves_png)
