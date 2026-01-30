@@ -206,6 +206,19 @@ jobs:
           echo "---- verify teacher outputs ----"
           ls -la out/cloud_metrics.csv
           ls -la out/masks | head -n 20 || true
+          
+          python - << 'PY'
+          import pandas as pd
+          df = pd.read_csv("out/cloud_metrics.csv")
+          # try common names
+          cols = [c for c in df.columns if "cloud" in c.lower() and "fraction" in c.lower()]
+          print("cloud fraction cols:", cols)
+          if cols:
+              c = cols[0]
+              print(df[c].describe())
+              print("quantiles:", df[c].quantile([0.01,0.05,0.25,0.5,0.75,0.95,0.99]).to_dict())
+          PY
+
 
       - name: Phase 3B - Train U-Net on teacher metrics
         shell: bash
@@ -319,6 +332,24 @@ jobs:
           ls -la "$OUTDIR" || true
           ls -la "$OUTDIR/masks_unet" | head -n 20 || true
           ls -la "$OUTDIR/cloud_metrics_unet.csv" || true
+
+          python - << 'PY'
+          from pathlib import Path
+          from PIL import Image
+          import numpy as np
+          
+          masks = sorted(Path("out/2026-01-29/phase3_unet_v2_thr03/masks_unet").glob("*.png"))[:10]
+          print("checking", len(masks), "masks")
+          bad = 0
+          for p in masks:
+              a = np.array(Image.open(p).convert("L"))
+              if a.max() == 0:
+                  bad += 1
+              print(p.name, "min/max", int(a.min()), int(a.max()), "white%", float((a>0).mean()))
+          if bad == len(masks) and len(masks)>0:
+              raise SystemExit("All checked masks are empty (all black). Failing.")
+          PY
+
 
 
       - name: Upload Phase 3 outputs (artifact)
