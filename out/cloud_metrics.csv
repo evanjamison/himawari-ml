@@ -45,3 +45,8 @@ data/raw/2026-01-30/master/frames/himawari_20260130T064000Z.png,out/masks/himawa
 data/raw/2026-01-30/master/frames/himawari_20260130T065000Z.png,out/masks/himawari_20260130T065000Z_mask.png,0.0179901123046875
 data/raw/2026-01-30/master/frames/himawari_20260130T070000Z.png,out/masks/himawari_20260130T070000Z_mask.png,0.0132598876953125
 data/raw/2026-01-30/master/frames/himawari_20260130T071000Z.png,out/masks/himawari_20260130T071000Z_mask.png,0.0102386474609375
+data/raw/2026-01-30/master/frames/himawari_20260130T072000Z.png,out/masks/himawari_20260130T072000Z_mask.png,0.007476806640625
+data/raw/2026-01-30/master/frames/himawari_20260130T073000Z.png,out/masks/himawari_20260130T073000Z_mask.png,0.007232666015625
+data/raw/2026-01-30/master/frames/himawari_20260130T074000Z.png,out/masks/himawari_20260130T074000Z_mask.png,0.0045013427734375
+data/raw/2026-01-30/master/frames/himawari_20260130T075000Z.png,out/masks/himawari_20260130T075000Z_mask.png,0.0026397705078125
+data/raw/2026-01-30/master/frames/himawari_20260130T080000Z.png,out/masks/himawari_20260130T080000Z_mask.png,0.0020294189453125

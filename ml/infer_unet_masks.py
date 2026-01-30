@@ -372,6 +372,16 @@ def main() -> int:
 
             logits = model(xt)  # (1,1,H,W)
             prob = torch.sigmoid(logits)[0, 0].detach().cpu().numpy()
+            print(
+                img_path.name,
+                "prob[min,max,mean]:",
+                float(prob.min()),
+                float(prob.max()),
+                float(prob.mean()),
+                "p90:", float(np.quantile(prob, 0.90)),
+                "p99:", float(np.quantile(prob, 0.99)),
+            )
+
 
             if args.use_disk_mask:
                 disk = (x.mean(axis=0) > float(args.disk_thresh)).astype(np.float32)  # 1 inside Earth, 0 in space
