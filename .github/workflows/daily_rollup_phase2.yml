@@ -228,7 +228,7 @@ jobs:
         id: autothr
         shell: bash
         env:
-          TARGET_WHITE_PCT: "8.0"   # <-- adjust if you want
+          TARGET_WHITE_PCT: "8.0"   # tweak if you want a different target
         run: |
           set -euo pipefail
 
@@ -241,21 +241,21 @@ jobs:
           echo "MODEL_PATH=$MODEL_PATH"
           echo "TARGET_WHITE_PCT=${TARGET_WHITE_PCT}"
 
+          # ✅ KEY FIX: make these visible to the heredoc Python via env
+          export DAY FRAMES MODEL_PATH TARGET_WHITE_PCT
+
           python - <<'PY'
-          import os, math, shutil
+          import os, shutil, subprocess
           from pathlib import Path
           import numpy as np
           from PIL import Image
-          import subprocess
 
-          target = float(os.environ["TARGET_WHITE_PCT"])  # ✅ real value
-          day = os.environ.get("DAY", "")
-          frames = os.environ.get("FRAMES", "")
-          model = os.environ.get("MODEL_PATH", "")
+          day = os.environ["DAY"]
+          frames = os.environ["FRAMES"]
+          model = os.environ["MODEL_PATH"]
+          target = float(os.environ["TARGET_WHITE_PCT"])
 
-          # NOTE: thresholds to probe
           thresholds = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
-
           best = None
 
           for thr in thresholds:
@@ -278,6 +278,7 @@ jobs:
 
             mdir = outdir / "masks_unet"
             files = sorted(mdir.glob("*.png"))[:20]
+
             if not files:
               avg_white = 0.0
             else:
@@ -294,10 +295,9 @@ jobs:
               best = {"thr": thr, "diff": diff, "avg_white": avg_white}
 
           print("BEST", best)
-          # write outputs for bash via file (simplest)
           Path("chosen_thr.txt").write_text(str(best["thr"]))
           PY
-        # export chosen threshold for later steps
+
       - name: Export chosen threshold
         id: thr
         shell: bash
@@ -306,6 +306,7 @@ jobs:
           best_thr="$(cat chosen_thr.txt)"
           echo "threshold=$best_thr" >> "$GITHUB_OUTPUT"
           echo "Chosen threshold: $best_thr"
+
 
 
       - name: Run Phase 3 (U-Net inference) using ml/infer_unet_masks.py (auto-threshold)
