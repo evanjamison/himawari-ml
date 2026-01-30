@@ -224,11 +224,13 @@ jobs:
           echo "model_path=${CANDS[0]}" >> "$GITHUB_OUTPUT"
           echo "Using newest: ${CANDS[0]}"
 
+      # ✅ FIXED: uses env vars correctly + probes only a few frames (faster)
       - name: Pick a good threshold automatically (TEMP)
         id: autothr
         shell: bash
         env:
-          TARGET_WHITE_PCT: "8.0"   # tweak if you want a different target
+          TARGET_WHITE_PCT: "8.0"   # target average % white pixels across sampled masks
+          SAMPLE_FRAMES: "5"
         run: |
           set -euo pipefail
 
@@ -240,9 +242,9 @@ jobs:
           echo "FRAMES=$FRAMES"
           echo "MODEL_PATH=$MODEL_PATH"
           echo "TARGET_WHITE_PCT=${TARGET_WHITE_PCT}"
+          echo "SAMPLE_FRAMES=${SAMPLE_FRAMES}"
 
-          # ✅ KEY FIX: make these visible to the heredoc Python via env
-          export DAY FRAMES MODEL_PATH TARGET_WHITE_PCT
+          export DAY FRAMES MODEL_PATH TARGET_WHITE_PCT SAMPLE_FRAMES
 
           python - <<'PY'
           import os, shutil, subprocess
@@ -251,11 +253,26 @@ jobs:
           from PIL import Image
 
           day = os.environ["DAY"]
-          frames = os.environ["FRAMES"]
+          frames_dir = Path(os.environ["FRAMES"])
           model = os.environ["MODEL_PATH"]
           target = float(os.environ["TARGET_WHITE_PCT"])
+          n_sample = int(os.environ.get("SAMPLE_FRAMES", "5"))
 
-          thresholds = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+          # sample a few frames deterministically
+          all_frames = sorted(frames_dir.rglob("*.png"))
+          if not all_frames:
+            raise SystemExit(f"No frames found under: {frames_dir}")
+          sample = all_frames[:n_sample]
+
+          # Copy sample to a temp dir so infer script can run fast
+          tmp = Path("out") / day / "_thr_probe_frames"
+          if tmp.exists():
+            shutil.rmtree(tmp)
+          tmp.mkdir(parents=True, exist_ok=True)
+          for f in sample:
+            shutil.copy2(f, tmp / f.name)
+
+          thresholds = [0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20]
           best = None
 
           for thr in thresholds:
@@ -266,10 +283,9 @@ jobs:
 
             cmd = [
               "python", "ml/infer_unet_masks.py",
-              "--frames", frames,
+              "--frames", str(tmp),
               "--outdir", str(outdir),
               "--ckpt", model,
-              "--recursive",
               "--threshold", str(thr),
               "--image-size", "256",
               "--device", "cpu",
@@ -277,18 +293,14 @@ jobs:
             subprocess.check_call(cmd)
 
             mdir = outdir / "masks_unet"
-            files = sorted(mdir.glob("*.png"))[:20]
-
-            if not files:
-              avg_white = 0.0
-            else:
-              whites = []
-              for f in files:
-                a = np.array(Image.open(f))
-                whites.append((a > 0).mean() * 100.0)
-              avg_white = float(np.mean(whites))
-
+            files = sorted(mdir.glob("*.png"))
+            whites = []
+            for f in files:
+              a = np.array(Image.open(f))
+              whites.append((a > 0).mean() * 100.0)
+            avg_white = float(np.mean(whites)) if whites else 0.0
             diff = abs(avg_white - target)
+
             print(f"thr={thr:.2f} -> avg_white%={avg_white:.4f} diff={diff:.4f}")
 
             if best is None or diff < best["diff"]:
@@ -307,8 +319,6 @@ jobs:
           echo "threshold=$best_thr" >> "$GITHUB_OUTPUT"
           echo "Chosen threshold: $best_thr"
 
-
-
       - name: Run Phase 3 (U-Net inference) using ml/infer_unet_masks.py (auto-threshold)
         id: phase3
         shell: bash
@@ -319,12 +329,19 @@ jobs:
           FRAMES="${{ steps.resolve.outputs.outframes }}"
           MODEL_PATH="${{ steps.model.outputs.model_path }}"
           THR="${{ steps.thr.outputs.threshold }}"
-          OUTDIR="out/${DAY}/phase3_unet_v2_thr${THR/./}"
+
+          # stable folder name: thr010 for 0.10, thr08 for 0.08, etc.
+          THR_TAG="$(python - <<PY
+          t=float("$THR")
+          print(f"{int(round(t*100)):02d}")
+          PY
+          )"
+          OUTDIR="out/${DAY}/phase3_unet_v2_thr${THR_TAG}"
 
           echo "DAY=$DAY"
           echo "FRAMES=$FRAMES"
           echo "MODEL_PATH=$MODEL_PATH"
-          echo "THR=$THR"
+          echo "THR=$THR (tag=$THR_TAG)"
           echo "OUTDIR=$OUTDIR"
 
           ls -la "$MODEL_PATH" || true
@@ -344,25 +361,21 @@ jobs:
           from pathlib import Path
           import numpy as np
           from PIL import Image
-          import os
 
-          # NOTE: We recompute OUTDIR the same way as bash did:
-          thr = os.environ.get("THR", "")
-          day = os.environ.get("DAY", "")
-          # We cannot rely on env vars here, so parse from filesystem:
-          # Find newest phase3_unet_v2_* folder for today
           root = Path("out") / Path(r"${{ steps.resolve.outputs.day }}")
           cand = sorted([p for p in root.glob("phase3_unet_v2_thr*") if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
-          p = cand[0] / "masks_unet" if cand else (root / "phase3_unet_v2_thr" / "masks_unet")
+          outdir = cand[0] if cand else root
+          p = outdir / "masks_unet"
 
           files = sorted(p.glob("*.png"))
+          print("phase3_out:", str(outdir))
           print("masks_unet:", str(p))
           print("count:", len(files))
 
           for f in files[:15]:
-              a = np.array(Image.open(f))
-              white = float((a > 0).mean()) * 100.0
-              print(f.name, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))
+            a = np.array(Image.open(f))
+            white = float((a > 0).mean()) * 100.0
+            print(f.name, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))
           PY
 
       - name: Upload Phase 3 outputs (artifact)
@@ -371,12 +384,12 @@ jobs:
           name: phase3_unet_${{ steps.resolve.outputs.day }}
           path: out/${{ steps.resolve.outputs.day }}/phase3_unet_v2_thr*
 
-
       - name: Commit results to data
         shell: bash
         run: |
           set -euo pipefail
           git add -f data/raw out || true
-          git commit -m "daily rollup + phase2 + phase3(thr=0.3): ${{ steps.resolve.outputs.day }}" || echo "No changes"
+          git commit -m "daily rollup + phase2 + phase3(auto-thr): ${{ steps.resolve.outputs.day }}" || echo "No changes"
           git push origin data
+
 
