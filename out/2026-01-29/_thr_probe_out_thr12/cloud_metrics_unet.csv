@@ -1,0 +1,6 @@
+relpath,mask_path,cloud_fraction_unet
+out/2026-01-29/_thr_probe_frames/himawari_20260128T210000Z.png,out/2026-01-29/_thr_probe_out_thr12/masks_unet/himawari_20260128T210000Z_mask.png,0.0004119873046875
+out/2026-01-29/_thr_probe_frames/himawari_20260128T211000Z.png,out/2026-01-29/_thr_probe_out_thr12/masks_unet/himawari_20260128T211000Z_mask.png,0.0003662109375
+out/2026-01-29/_thr_probe_frames/himawari_20260128T212000Z.png,out/2026-01-29/_thr_probe_out_thr12/masks_unet/himawari_20260128T212000Z_mask.png,0.0004119873046875
+out/2026-01-29/_thr_probe_frames/himawari_20260128T213000Z.png,out/2026-01-29/_thr_probe_out_thr12/masks_unet/himawari_20260128T213000Z_mask.png,0.0004119873046875
+out/2026-01-29/_thr_probe_frames/himawari_20260128T214000Z.png,out/2026-01-29/_thr_probe_out_thr12/masks_unet/himawari_20260128T214000Z_mask.png,0.0004425048828125
