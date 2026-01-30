@@ -294,91 +294,116 @@ jobs:
               print("pos_weight:", ckpt.get("config", {}).get("pos_weight"))
           PY
 
-      - name: Phase 3D - Infer masks (threshold 0.3) + debug pixel stats
+      - name: Phase 3D - Infer masks (multi-threshold) + debug pixel stats
         shell: bash
         run: |
           set -euo pipefail
-
+      
           DAY="${{ steps.resolve.outputs.day }}"
           : "${DAY:?ERROR: steps.resolve.outputs.day is empty}"
-          
+      
           RAWDIR="${{ steps.resolve.outputs.outframes }}"
-          ls -la "${{ steps.resolve.outputs.outmaster }}" || true
-          ls -la "$RAWDIR" || { echo "ERROR: frames dir not created yet: $RAWDIR"; exit 1; }
-          
-          MODEL_PATH="out/models/unet_cloudmask_latest.pt"
-          test -f "$MODEL_PATH" || { echo "ERROR: missing checkpoint: $MODEL_PATH"; ls -la out/models || true; exit 1; }
-
-          : "${MODEL_PATH:?ERROR: model_path missing}"
-          
-          OUTDIR="out/$DAY/phase3_unet_v2_thr03"
-          mkdir -p "$OUTDIR"
-
-
+          : "${RAWDIR:?ERROR: steps.resolve.outputs.outframes is empty}"
+      
           echo "DAY=$DAY"
           echo "RAWDIR=$RAWDIR"
+      
+          ls -la "${{ steps.resolve.outputs.outmaster }}" || true
+          ls -la "$RAWDIR" || { echo "ERROR: frames dir not created yet: $RAWDIR"; exit 1; }
+      
+          MODEL_PATH="out/models/unet_cloudmask_latest.pt"
+          test -f "$MODEL_PATH" || { echo "ERROR: missing checkpoint: $MODEL_PATH"; ls -la out/models || true; exit 1; }
+      
           echo "MODEL_PATH=$MODEL_PATH"
           ls -la "$MODEL_PATH" || true
-
-          for T in 0.5 0.6 0.7 0.8; do
+      
+          echo "---- checkpoint identity ----"
+          python - <<'PY'
+          import torch
+          p="out/models/unet_cloudmask_latest.pt"
+          ckpt=torch.load(p, map_location="cpu")
+          print("ckpt type:", type(ckpt))
+          if isinstance(ckpt, dict):
+            cfg = ckpt.get("config", {})
+            print("run_id:", cfg.get("run_id"))
+            print("use_disk_mask:", cfg.get("use_disk_mask"))
+            print("pos_weight:", cfg.get("pos_weight"))
+            print("bce_weight:", cfg.get("bce_weight"))
+          PY
+      
+          # ✅ Always include 0.3 (your usual), plus higher thresholds to compare
+          THRS="0.3 0.5 0.6 0.7 0.8"
+      
+          # ✅ Canonical output for downstream steps (0.3)
+          CANON_OUT="out/$DAY/phase3_unet_v2_thr03_disk"
+      
+          for T in $THRS; do
             OUTDIR="out/$DAY/phase3_unet_v2_thr${T/./}_disk"
+            echo "---- infer threshold=$T -> $OUTDIR ----"
+            mkdir -p "$OUTDIR"
+      
             python ml/infer_unet_masks.py \
               --frames "$RAWDIR" \
               --outdir "$OUTDIR" \
-              --ckpt "out/models/unet_cloudmask_latest.pt" \
+              --ckpt "$MODEL_PATH" \
               --recursive \
               --threshold "$T" \
               --image-size 256 \
               --device cpu \
               --use-disk-mask \
               --disk-thresh 0.02
+      
+            # ✅ Debug the actual output we just created
+            python - <<PY
+      from pathlib import Path
+      import numpy as np
+      from PIL import Image
+      
+      outdir = Path("$OUTDIR") / "masks_unet"
+      files = sorted(outdir.glob("*.png"))
+      print("masks_unet:", outdir)
+      print("count:", len(files))
+      if not files:
+          raise SystemExit("No mask PNGs found.")
+      
+      for f in files[:5]:
+          a = np.array(Image.open(f).convert("L"))
+          white = (a >= 128).mean() * 100.0
+          print(f.name, "shape", a.shape, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))
+      PY
+      
+            # list a few files
+            ls -la "$OUTDIR" || true
+            ls -la "$OUTDIR/masks_unet" | head -n 10 || true
+            ls -la "$OUTDIR/cloud_metrics_unet.csv" || true
           done
-
-
-          echo "---- debug: check masks not-empty (white pixel %) ----"
-          python - <<'PY'
-          from pathlib import Path
-          import numpy as np
-          from PIL import Image
-
-          # NOTE: We do NOT use $DAY here, so bash can't "unbound variable" inside the heredoc.
-          day = "${{ steps.resolve.outputs.day }}"
-          outdir = Path("out") / day / "phase3_unet_v2_thr03" / "masks_unet"
-
-          files = sorted(outdir.glob("*.png"))
-          print("masks_unet:", outdir)
-          print("count:", len(files))
-          if not files:
-              raise SystemExit("No mask PNGs found.")
-
-          for f in files[:5]:
-              a = np.array(Image.open(f))
-              white = (a >= 128).mean() * 100.0
-              print(f.name, "shape", a.shape, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))
-          PY
-
-          echo "---- phase3 outputs ----"
-          ls -la "$OUTDIR" || true
-          ls -la "$OUTDIR/masks_unet" | head -n 20 || true
-          ls -la "$OUTDIR/cloud_metrics_unet.csv" || true
-
-
-          python - << 'PY'
-          from pathlib import Path
-          from PIL import Image
-          import numpy as np
-          
-          masks = sorted(Path("out/2026-01-29/phase3_unet_v2_thr03/masks_unet").glob("*.png"))[:10]
-          print("checking", len(masks), "masks")
-          bad = 0
-          for p in masks:
-              a = np.array(Image.open(p).convert("L"))
-              if a.max() == 0:
-                  bad += 1
-              print(p.name, "min/max", int(a.min()), int(a.max()), "white%", float((a>0).mean()))
-          if bad == len(masks) and len(masks)>0:
-              raise SystemExit("All checked masks are empty (all black). Failing.")
-          PY
+      
+          # ✅ Make sure thr03 exists and optionally copy it to a canonical path (already canonical)
+          test -d "$CANON_OUT/masks_unet" || { echo "ERROR: canonical output missing: $CANON_OUT/masks_unet"; exit 1; }
+      
+          # ✅ Hard fail if canonical masks are all black
+          python - <<PY
+      from pathlib import Path
+      from PIL import Image
+      import numpy as np
+      
+      outdir = Path("$CANON_OUT") / "masks_unet"
+      masks = sorted(outdir.glob("*.png"))[:10]
+      print("canonical check:", outdir)
+      print("checking", len(masks), "masks")
+      if not masks:
+          raise SystemExit("No canonical mask PNGs found.")
+      
+      bad = 0
+      for p in masks:
+          a = np.array(Image.open(p).convert("L"))
+          if a.max() == 0:
+              bad += 1
+          print(p.name, "min/max", int(a.min()), int(a.max()), "white%:", float((a > 0).mean() * 100.0))
+      
+      if bad == len(masks):
+          raise SystemExit("All checked canonical masks are empty (all black). Failing.")
+      PY
 
 
 
