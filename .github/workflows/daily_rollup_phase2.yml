@@ -298,20 +298,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-      
-          CKPT="out/models/unet_cloudmask_latest.pt"
-          test -f "$CKPT" || (echo "Missing ckpt: $CKPT" && ls -lh out/models && exit 1)
-      
+
+          DAY="${{ steps.resolve.outputs.day }}"
+          : "${DAY:?ERROR: steps.resolve.outputs.day is empty}"
+          
+          RAWDIR="${{ steps.resolve.outputs.frames }}"
+          MODEL_PATH="${{ steps.model.outputs.model_path }}"
+          echo "[DEBUG] DAY='$DAY'"
+          : "${RAWDIR:?ERROR: outframes missing}"
+          : "${MODEL_PATH:?ERROR: model_path missing}"
+
+
+          OUTDIR="out/$DAY/phase3_unet_v2_thr03"
+          mkdir -p "$OUTDIR"
+
+          echo "DAY=$DAY"
+          echo "RAWDIR=$RAWDIR"
+          echo "MODEL_PATH=$MODEL_PATH"
+          ls -la "$MODEL_PATH" || true
+
           python ml/infer_unet_masks.py \
-            --frames "data/raw/${DAY}/master/frames" \
-            --outdir "out/${DAY}/phase3_unet_v2_thr03" \
-            --ckpt "$CKPT" \
+            --frames "$RAWDIR" \
+            --outdir "$OUTDIR" \
+            --ckpt "$MODEL_PATH" \
             --recursive \
             --threshold 0.3 \
             --image-size 256 \
             --device cpu
-
-
 
           echo "---- debug: check masks not-empty (white pixel %) ----"
           python - <<'PY'
@@ -319,24 +332,27 @@ jobs:
           import numpy as np
           from PIL import Image
 
-          outdir = Path("out") / "${{ steps.resolve.outputs.day }}" / "phase3_unet_v2_thr03" / "masks_unet"
+          # NOTE: We do NOT use $DAY here, so bash can't "unbound variable" inside the heredoc.
+          day = "${{ steps.resolve.outputs.day }}"
+          outdir = Path("out") / day / "phase3_unet_v2_thr03" / "masks_unet"
+
           files = sorted(outdir.glob("*.png"))
           print("masks_unet:", outdir)
           print("count:", len(files))
           if not files:
-            raise SystemExit("No mask PNGs found.")
+              raise SystemExit("No mask PNGs found.")
 
-          # sample first 5
           for f in files[:5]:
-            a = np.array(Image.open(f))
-            white = (a >= 128).mean() * 100.0
-            print(f.name, "shape", a.shape, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))
+              a = np.array(Image.open(f))
+              white = (a >= 128).mean() * 100.0
+              print(f.name, "shape", a.shape, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))
           PY
 
           echo "---- phase3 outputs ----"
           ls -la "$OUTDIR" || true
           ls -la "$OUTDIR/masks_unet" | head -n 20 || true
           ls -la "$OUTDIR/cloud_metrics_unet.csv" || true
+
 
           python - << 'PY'
           from pathlib import Path
