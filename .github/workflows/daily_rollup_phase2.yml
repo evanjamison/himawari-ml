@@ -305,9 +305,10 @@ jobs:
           RAWDIR="${{ steps.resolve.outputs.outframes }}"
           ls -la "${{ steps.resolve.outputs.outmaster }}" || true
           ls -la "$RAWDIR" || { echo "ERROR: frames dir not created yet: $RAWDIR"; exit 1; }
+          
+          MODEL_PATH="out/models/unet_cloudmask_latest.pt"
+          test -f "$MODEL_PATH" || { echo "ERROR: missing checkpoint: $MODEL_PATH"; ls -la out/models || true; exit 1; }
 
-          MODEL_PATH="${{ steps.model.outputs.model_path }}"
-          : "${RAWDIR:?ERROR: outframes missing}"
           : "${MODEL_PATH:?ERROR: model_path missing}"
           
           OUTDIR="out/$DAY/phase3_unet_v2_thr03"
