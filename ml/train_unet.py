@@ -636,7 +636,7 @@ def main() -> int:
 
     print(
     "[TRAIN] saved checkpoint:",
-    out_ckpt,
+    best_path,
     "run_id:", run_id,
     "use_disk_mask:", args.use_disk_mask,
     "pos_weight:", pos_weight,
