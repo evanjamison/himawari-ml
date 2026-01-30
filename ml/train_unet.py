@@ -638,14 +638,12 @@ def main() -> int:
             )
 
     # ✅ FIX: use the correct variable name (pos_weight_val) and ensure this print never NameErrors
-    print(
-        "[TRAIN] saved checkpoint:",
-        best_path,
-        "run_id:", run_id,
-        "use_disk_mask:", args.use_disk_mask,
-        "pos_weight:", pos_weight_val,
-        "bce_weight:", float(args.bce_weight),
-    )
+    # ---- final summary (NO NameErrors) ----
+    print("[TRAIN] saved checkpoint:", str(best_path))
+    print("[TRAIN] run_id:", run_id)
+    print("[TRAIN] use_disk_mask:", bool(args.use_disk_mask), "disk_thresh:", float(args.disk_thresh))
+    print("[TRAIN] pos_weight:", float(pos_weight_val), "bce_weight:", float(args.bce_weight))
+
 
     hist = pd.DataFrame(history)
     hist.to_csv(metrics_path, index=False)
