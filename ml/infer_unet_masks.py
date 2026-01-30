@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -192,6 +192,13 @@ def extract_state_dict(ckpt_obj) -> Dict[str, torch.Tensor]:
         for k in ("model", "state_dict", "model_state_dict"):
             if k in ckpt_obj and isinstance(ckpt_obj[k], dict):
                 return ckpt_obj[k]
+        # sometimes people save raw state_dict inside dict
+        # if it looks like a state_dict, just return it
+        if all(isinstance(v, torch.Tensor) for v in ckpt_obj.values()):
+            return ckpt_obj
+        return ckpt_obj
+    # raw state_dict
+    if isinstance(ckpt_obj, dict) and all(isinstance(v, torch.Tensor) for v in ckpt_obj.values()):
         return ckpt_obj
     raise ValueError("Unrecognized checkpoint format")
 
@@ -244,6 +251,10 @@ def main() -> int:
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--device", default="", help="cpu|cuda (default auto)")
 
+    # optional inference-time disk masking
+    ap.add_argument("--use-disk-mask", action="store_true", help="Zero out predictions in space (recommended on Himawari)")
+    ap.add_argument("--disk-thresh", type=float, default=0.02, help="Mean RGB threshold for disk mask in [0,1]")
+
     args = ap.parse_args()
 
     metrics_csv = str(args.metrics_csv).strip()
@@ -258,22 +269,51 @@ def main() -> int:
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load checkpoint first, infer architecture
-    ckpt_path = Path(args.ckpt)
+    # ---- Resolve ckpt path robustly (relative to repo root) ----
+    ckpt_path = Path(args.ckpt).expanduser()
     if not ckpt_path.is_absolute():
         ckpt_path = (REPO_ROOT / ckpt_path).resolve()
+    else:
+        ckpt_path = ckpt_path.resolve()
+
     if not ckpt_path.exists():
         raise SystemExit(f"ERROR: --ckpt not found: {ckpt_path}")
+    if ckpt_path.is_dir():
+        raise SystemExit(f"ERROR: --ckpt points to a directory, expected .pt file: {ckpt_path}")
 
-    ckpt_obj = torch.load(ckpt_path, map_location=device)
-    sd = normalize_keys(extract_state_dict(ckpt_obj))
+    print(f"[INFER] loading checkpoint: {ckpt_path}")
+
+    # ---- Load checkpoint object (define ckpt!) ----
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    # ---- Print ckpt identity/config if present ----
+    if isinstance(ckpt, dict):
+        cfg = ckpt.get("config", {})
+        if isinstance(cfg, dict):
+            print(
+                "[INFER] ckpt config:",
+                "run_id=", cfg.get("run_id"),
+                "use_disk_mask=", cfg.get("use_disk_mask"),
+                "disk_thresh=", cfg.get("disk_thresh"),
+                "pos_weight=", cfg.get("pos_weight"),
+                "bce_weight=", cfg.get("bce_weight"),
+            )
+        else:
+            print("[INFER] ckpt has dict format but no 'config' dict")
+    else:
+        print("[INFER] ckpt is not a dict (raw state_dict)")
+
+    # ---- Extract/normalize state_dict, infer architecture ----
+    sd = normalize_keys(extract_state_dict(ckpt))
     base, depth = infer_base_and_depth(sd)
 
-    # Collect images + build df
+    # ---- Collect images + build df ----
     if metrics_csv:
-        mp = Path(metrics_csv)
+        mp = Path(metrics_csv).expanduser()
         if not mp.is_absolute():
             mp = (REPO_ROOT / mp).resolve()
+        else:
+            mp = mp.resolve()
         if not mp.exists():
             raise SystemExit(f"ERROR: metrics CSV not found: {mp}")
 
@@ -290,11 +330,15 @@ def main() -> int:
             p = Path(rp)
             if not p.is_absolute():
                 p = (REPO_ROOT / p).resolve()
+            else:
+                p = p.resolve()
             img_paths.append(p)
     else:
         frames_dir = Path(frames_arg).expanduser()
         if not frames_dir.is_absolute():
             frames_dir = (REPO_ROOT / frames_dir).resolve()
+        else:
+            frames_dir = frames_dir.resolve()
         if not frames_dir.exists() or not frames_dir.is_dir():
             raise SystemExit(f"ERROR: --frames directory not found: {frames_dir}")
 
@@ -303,17 +347,18 @@ def main() -> int:
             raise SystemExit(f"ERROR: No images found in {frames_dir} (recursive={bool(args.recursive)})")
         df = pd.DataFrame({"relpath": [to_repo_rel(p) for p in img_paths]})
 
-    # Build model that matches ckpt
+    # ---- Build model that matches ckpt ----
     if depth == 3:
         model = UNet3(in_ch=3, base=base, out_ch=1).to(device)
     else:
         model = UNet4(in_ch=3, base=base, out_ch=1).to(device)
 
-    # Strict load SHOULD succeed now
+    # Strict load should succeed if architecture matches
     model.load_state_dict(sd, strict=True)
     model.eval()
+    print(f"[INFER] loaded checkpoint with base={base}, depth={depth}")
 
-    # Inference
+    # ---- Inference ----
     mask_paths: List[str] = []
     cloud_fracs: List[float] = []
 
@@ -327,10 +372,14 @@ def main() -> int:
 
             logits = model(xt)  # (1,1,H,W)
             prob = torch.sigmoid(logits)[0, 0].detach().cpu().numpy()
-            # --- disk mask (inference-time) ---
-            # x is CHW in [0,1]
-            disk = (x.mean(axis=0) > 0.02).astype(np.float32)   # 1 inside Earth, 0 in space
-            prob = prob * disk                                  # zero out space predictions
+
+            if args.use_disk_mask:
+                disk = (x.mean(axis=0) > float(args.disk_thresh)).astype(np.float32)  # 1 inside Earth, 0 in space
+                prob = prob * disk
+
+            # helpful debug stats
+            # (keep it light; Actions logs can get huge)
+            # print(img_path.name, "prob[min,max,mean]:", float(prob.min()), float(prob.max()), float(prob.mean()))
 
             mask = (prob >= float(args.threshold)).astype(np.uint8) * 255
             mask_out = out_masks / f"{img_path.stem}_mask.png"
@@ -345,7 +394,6 @@ def main() -> int:
     out_csv = out_root / "cloud_metrics_unet.csv"
     df.to_csv(out_csv, index=False)
 
-    print(f"Loaded checkpoint with base={base}, depth={depth}")
     print(f"Wrote: {out_csv}")
     print(f"Wrote masks: {out_masks}")
     return 0
