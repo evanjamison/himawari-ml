@@ -327,6 +327,10 @@ def main() -> int:
 
             logits = model(xt)  # (1,1,H,W)
             prob = torch.sigmoid(logits)[0, 0].detach().cpu().numpy()
+            # --- disk mask (inference-time) ---
+            # x is CHW in [0,1]
+            disk = (x.mean(axis=0) > 0.02).astype(np.float32)   # 1 inside Earth, 0 in space
+            prob = prob * disk                                  # zero out space predictions
 
             mask = (prob >= float(args.threshold)).astype(np.uint8) * 255
             mask_out = out_masks / f"{img_path.stem}_mask.png"
