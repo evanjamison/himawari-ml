@@ -358,14 +358,14 @@ jobs:
             from pathlib import Path
             import numpy as np
             from PIL import Image
-            
+
             outdir = Path("$OUTDIR") / "masks_unet"
             files = sorted(outdir.glob("*.png"))
             print("masks_unet:", outdir)
             print("count:", len(files))
             if not files:
-            raise SystemExit("No mask PNGs found.")
-      
+                raise SystemExit("No mask PNGs found.")
+
             for f in files[:5]:
                 a = np.array(Image.open(f).convert("L"))
                 white = (a >= 128).mean() * 100.0
