@@ -266,6 +266,23 @@ def main() -> int:
         raise SystemExit(f"ERROR: --ckpt not found: {ckpt_path}")
 
     ckpt_obj = torch.load(ckpt_path, map_location=device)
+    print("[INFER] loading checkpoint:", args.ckpt)
+
+    if isinstance(ckpt, dict):
+        cfg = ckpt.get("config", {})
+        print(
+            "[INFER] ckpt run_id:",
+            cfg.get("run_id"),
+            "use_disk_mask:",
+            cfg.get("use_disk_mask"),
+            "pos_weight:",
+            cfg.get("pos_weight"),
+            "bce_weight:",
+            cfg.get("bce_weight"),
+        )
+    else:
+        print("[INFER] ckpt has no config dict")
+
     sd = normalize_keys(extract_state_dict(ckpt_obj))
     base, depth = infer_base_and_depth(sd)
 
@@ -331,6 +348,13 @@ def main() -> int:
             # x is CHW in [0,1]
             disk = (x.mean(axis=0) > 0.02).astype(np.float32)   # 1 inside Earth, 0 in space
             prob = prob * disk                                  # zero out space predictions
+            print(
+                img_path.name,
+                "prob[min,max,mean]:",
+                float(prob.min()),
+                float(prob.max()),
+                float(prob.mean()),
+            )
 
             mask = (prob >= float(args.threshold)).astype(np.uint8) * 255
             mask_out = out_masks / f"{img_path.stem}_mask.png"
