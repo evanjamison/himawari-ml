@@ -302,15 +302,17 @@ jobs:
           DAY="${{ steps.resolve.outputs.day }}"
           : "${DAY:?ERROR: steps.resolve.outputs.day is empty}"
           
-          RAWDIR="${{ steps.resolve.outputs.frames }}"
+          RAWDIR="${{ steps.resolve.outputs.outframes }}"
+          ls -la "${{ steps.resolve.outputs.outmaster }}" || true
+          ls -la "$RAWDIR" || { echo "ERROR: frames dir not created yet: $RAWDIR"; exit 1; }
+
           MODEL_PATH="${{ steps.model.outputs.model_path }}"
-          echo "[DEBUG] DAY='$DAY'"
           : "${RAWDIR:?ERROR: outframes missing}"
           : "${MODEL_PATH:?ERROR: model_path missing}"
-
-
+          
           OUTDIR="out/$DAY/phase3_unet_v2_thr03"
           mkdir -p "$OUTDIR"
+
 
           echo "DAY=$DAY"
           echo "RAWDIR=$RAWDIR"
