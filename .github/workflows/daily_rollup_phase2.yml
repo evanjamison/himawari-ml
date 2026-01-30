@@ -253,64 +253,46 @@ jobs:
 
 
       - name: Phase 3C - Resolve trained checkpoint from newest metrics (robust)
-        id: model
         shell: bash
         run: |
           set -euo pipefail
-
+      
           echo "---- after training, list recent artifacts ----"
-          find out/models -type f \( -name "*.pt" -o -name "*.metrics.csv" -o -name "*.config.json" \) -printf "%T@ %p\n" | sort -nr | head -n 30 || true
-
-          # ✅ Find newest metrics file (this anchors us to the actual run)
-          METRICS="$(find out/models -type f -name "*.metrics.csv" -printf "%T@|%p\n" | sort -nr | head -n 1 | cut -d'|' -f2-)"
-
-          if [[ -z "${METRICS:-}" || ! -f "$METRICS" ]]; then
-            echo "ERROR: No *.metrics.csv found under out/models after training."
+          ls -lt out/models | head -n 80
+      
+          # pick newest *.metrics.csv and use corresponding .pt
+          newest_metrics="$(ls -t out/models/*.metrics.csv | head -n 1)"
+          echo "Newest metrics: ${newest_metrics}"
+      
+          ckpt="${newest_metrics%.metrics.csv}.pt"
+          echo "Using checkpoint: ${ckpt}"
+      
+          if [[ ! -f "${ckpt}" ]]; then
+            echo "ERROR: checkpoint not found: ${ckpt}"
             exit 1
           fi
+      
+          # copy to canonical name
+          cp -f "${ckpt}" out/models/unet_cloudmask_latest.pt
+          echo "Wrote canonical checkpoint: out/models/unet_cloudmask_latest.pt"
+      
+          ls -lh out/models/unet_cloudmask_latest.pt
 
-          echo "Newest metrics: $METRICS"
-          STEM="${METRICS%.metrics.csv}"
-          PT="$STEM.pt"
-
-          if [[ ! -f "$PT" ]]; then
-            echo "ERROR: Expected checkpoint next to metrics but not found:"
-            echo "  expected: $PT"
-            echo "Searching for matching .pt by basename..."
-            BASE="$(basename "$STEM")"
-            MATCH="$(find out/models -type f -name "${BASE}.pt" | head -n 1 || true)"
-            [[ -n "$MATCH" ]] || { echo "ERROR: Could not find ${BASE}.pt anywhere under out/models"; exit 1; }
-            PT="$MATCH"
-          fi
-
-          echo "Using checkpoint: $PT"
-          ls -la "$PT" || true
-
-          # Optional: keep canonical latest for other workflows
-          CANON="out/models/unet_cloudmask_latest.pt"
-          cp -f "$PT" "$CANON"
-          echo "Wrote canonical checkpoint: $CANON"
-          ls -la "$CANON" || true
-
-          echo "model_path=$PT" >> "$GITHUB_OUTPUT"
-          echo "canon_path=$CANON" >> "$GITHUB_OUTPUT"
-
-          - name: Debug checkpoint identity
-          shell: bash
-          run: |
-            ls -lh out/models
-            python - <<'PY'
-            import torch
-            p = "out/models/unet_cloudmask_latest.pt"
-            print("exists:", p)
-            ckpt = torch.load(p, map_location="cpu")
-            print("ckpt type:", type(ckpt))
-            if isinstance(ckpt, dict):
-                print("run_id:", ckpt.get("config", {}).get("run_id"))
-                print("use_disk_mask:", ckpt.get("config", {}).get("use_disk_mask"))
-                print("pos_weight:", ckpt.get("config", {}).get("pos_weight"))
-            PY
-
+      - name: Debug checkpoint identity
+        shell: bash
+        run: |
+          ls -lh out/models
+          python - <<'PY'
+          import torch
+          p = "out/models/unet_cloudmask_latest.pt"
+          print("exists:", p)
+          ckpt = torch.load(p, map_location="cpu")
+          print("ckpt type:", type(ckpt))
+          if isinstance(ckpt, dict):
+              print("run_id:", ckpt.get("config", {}).get("run_id"))
+              print("use_disk_mask:", ckpt.get("config", {}).get("use_disk_mask"))
+              print("pos_weight:", ckpt.get("config", {}).get("pos_weight"))
+          PY
 
       - name: Phase 3D - Infer masks (threshold 0.3) + debug pixel stats
         shell: bash
