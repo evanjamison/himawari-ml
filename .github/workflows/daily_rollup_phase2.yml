@@ -320,14 +320,20 @@ jobs:
           echo "MODEL_PATH=$MODEL_PATH"
           ls -la "$MODEL_PATH" || true
 
-          python ml/infer_unet_masks.py \
-            --frames "$RAWDIR" \
-            --outdir "$OUTDIR" \
-            --ckpt "$MODEL_PATH" \
-            --recursive \
-            --threshold 0.3 \
-            --image-size 256 \
-            --device cpu
+          for T in 0.5 0.6 0.7 0.8; do
+            OUTDIR="out/$DAY/phase3_unet_v2_thr${T/./}_disk"
+            python ml/infer_unet_masks.py \
+              --frames "$RAWDIR" \
+              --outdir "$OUTDIR" \
+              --ckpt "out/models/unet_cloudmask_latest.pt" \
+              --recursive \
+              --threshold "$T" \
+              --image-size 256 \
+              --device cpu \
+              --use-disk-mask \
+              --disk-thresh 0.02
+          done
+
 
           echo "---- debug: check masks not-empty (white pixel %) ----"
           python - <<'PY'
