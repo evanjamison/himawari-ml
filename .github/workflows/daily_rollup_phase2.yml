@@ -216,14 +216,17 @@ jobs:
           # python ml/train_unet.py --metrics-csv out/cloud_metrics.csv --outdir out/models ...
           python ml/train_unet.py \
             --metrics-csv out/cloud_metrics.csv \
-            --outdir out/models \
+            --outdir out \
             --epochs 30 \
             --batch-size 4 \
             --lr 3e-4 \
             --base-ch 32 \
             --augment \
-            --bce-weight 0.2 \
-            --device cpu
+            --bce-weight 0.1 \
+            --use-disk-mask \
+            --pos-weight auto \
+            --split-by-time
+
 
           echo "---- list models ----"
           find out/models -type f -name "*.pt" -maxdepth 4 -print || true
