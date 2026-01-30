@@ -265,6 +265,16 @@ def main() -> int:
     if not ckpt_path.exists():
         raise SystemExit(f"ERROR: --ckpt not found: {ckpt_path}")
 
+    ckpt_path = Path(args.ckpt).resolve()
+
+    if not ckpt_path.exists():
+        raise SystemExit(f"ERROR: --ckpt not found: {ckpt_path}")
+    if ckpt_path.is_dir():
+        raise SystemExit(f"ERROR: --ckpt points to a directory, expected .pt file: {ckpt_path}")
+    if ckpt_path.suffix.lower() != ".pt":
+        print(f"[WARN] --ckpt does not end with .pt: {ckpt_path}")
+
+    
     ckpt_obj = torch.load(ckpt_path, map_location=device)
     print("[INFER] loading checkpoint:", args.ckpt)
 
