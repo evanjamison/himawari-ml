@@ -298,22 +298,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          DAY="${{ steps.resolve.outputs.day }}"
-          RAWDIR="${{ steps.resolve.outputs.outframes }}"
-          MODEL_PATH="${{ steps.model.outputs.model_path }}"
-
-          OUTDIR="out/$DAY/phase3_unet_v2_thr03"
-          mkdir -p "$OUTDIR"
-
+      
+          CKPT="out/models/unet_cloudmask_latest.pt"
+          test -f "$CKPT" || (echo "Missing ckpt: $CKPT" && ls -lh out/models && exit 1)
+      
           python ml/infer_unet_masks.py \
-            --frames "$RAWDIR" \
-            --outdir "$OUTDIR" \
-            --ckpt "$MODEL_PATH" \
+            --frames "data/raw/${DAY}/master/frames" \
+            --outdir "out/${DAY}/phase3_unet_v2_thr03" \
+            --ckpt "$CKPT" \
             --recursive \
-            --threshold 0.5 \
+            --threshold 0.3 \
             --image-size 256 \
             --device cpu
+
+
 
           echo "---- debug: check masks not-empty (white pixel %) ----"
           python - <<'PY'
