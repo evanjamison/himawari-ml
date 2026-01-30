@@ -355,22 +355,22 @@ jobs:
       
             # ✅ Debug the actual output we just created
             python - <<PY
-      from pathlib import Path
-      import numpy as np
-      from PIL import Image
+            from pathlib import Path
+            import numpy as np
+            from PIL import Image
+            
+            outdir = Path("$OUTDIR") / "masks_unet"
+            files = sorted(outdir.glob("*.png"))
+            print("masks_unet:", outdir)
+            print("count:", len(files))
+            if not files:
+            raise SystemExit("No mask PNGs found.")
       
-      outdir = Path("$OUTDIR") / "masks_unet"
-      files = sorted(outdir.glob("*.png"))
-      print("masks_unet:", outdir)
-      print("count:", len(files))
-      if not files:
-          raise SystemExit("No mask PNGs found.")
-      
-      for f in files[:5]:
-          a = np.array(Image.open(f).convert("L"))
-          white = (a >= 128).mean() * 100.0
-          print(f.name, "shape", a.shape, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))
-      PY
+            for f in files[:5]:
+                a = np.array(Image.open(f).convert("L"))
+                white = (a >= 128).mean() * 100.0
+                print(f.name, "shape", a.shape, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))
+            PY
       
             # list a few files
             ls -la "$OUTDIR" || true
@@ -383,27 +383,27 @@ jobs:
       
           # ✅ Hard fail if canonical masks are all black
           python - <<PY
-      from pathlib import Path
-      from PIL import Image
-      import numpy as np
-      
-      outdir = Path("$CANON_OUT") / "masks_unet"
-      masks = sorted(outdir.glob("*.png"))[:10]
-      print("canonical check:", outdir)
-      print("checking", len(masks), "masks")
-      if not masks:
-          raise SystemExit("No canonical mask PNGs found.")
-      
-      bad = 0
-      for p in masks:
-          a = np.array(Image.open(p).convert("L"))
-          if a.max() == 0:
-              bad += 1
-          print(p.name, "min/max", int(a.min()), int(a.max()), "white%:", float((a > 0).mean() * 100.0))
-      
-      if bad == len(masks):
-          raise SystemExit("All checked canonical masks are empty (all black). Failing.")
-      PY
+          from pathlib import Path
+          from PIL import Image
+          import numpy as np
+          
+          outdir = Path("$CANON_OUT") / "masks_unet"
+          masks = sorted(outdir.glob("*.png"))[:10]
+          print("canonical check:", outdir)
+          print("checking", len(masks), "masks")
+          if not masks:
+              raise SystemExit("No canonical mask PNGs found.")
+          
+          bad = 0
+          for p in masks:
+              a = np.array(Image.open(p).convert("L"))
+              if a.max() == 0:
+                  bad += 1
+              print(p.name, "min/max", int(a.min()), int(a.max()), "white%:", float((a > 0).mean() * 100.0))
+          
+          if bad == len(masks):
+              raise SystemExit("All checked canonical masks are empty (all black). Failing.")
+          PY
 
 
 
