@@ -9,6 +9,10 @@ on:
         description: "Optional day (YYYY-MM-DD or YYYYMMDD). Leave blank to auto-detect."
         required: false
         default: ""
+      phase3_mode:
+        description: "Phase 3 training mode: 'seg' (pixel-mask segmentation) or 'metrics' (metric-supervised)."
+        required: false
+        default: "seg"
 
 permissions:
   contents: write
@@ -46,11 +50,17 @@ jobs:
           echo "---- verify filter_black_frames.py exists ----"
           ls -la scripts/pipeline/filter_black_frames.py
 
-          echo "---- verify phase3 runner exists (optional) ----"
-          ls -la scripts/pipeline/run_phase3_unet_daily.py || true
-
           echo "---- verify teacher baseline exists ----"
           ls -la scripts/experiments/segmentation/cloud_mask_baseline_v2.py
+
+          echo "---- verify metric-mode trainer exists ----"
+          ls -la ml/train_unet.py
+
+          echo "---- verify seg-mode trainer exists ----"
+          ls -la ml/train_unet_pixelmask.py
+
+          echo "---- verify infer exists ----"
+          ls -la ml/infer_unet_masks.py
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -67,7 +77,7 @@ jobs:
           # ✅ baseline v2 imports cv2; use headless OpenCV on GH runners
           pip install opencv-python-headless
 
-      - name: Resolve DAY + input roots
+      - name: Resolve DAY + input roots + Phase3 mode
         id: resolve
         shell: bash
         run: |
@@ -75,10 +85,23 @@ jobs:
 
           RAWROOT="data/raw"
           INPUT_DAY="${{ github.event.inputs.day }}"
+          INPUT_MODE="${{ github.event.inputs.phase3_mode }}"
 
           norm_day() {
             [[ "$1" =~ ^[0-9]{8}$ ]] && echo "${1:0:4}-${1:4:2}-${1:6:2}" || echo "$1"
           }
+
+          # schedule runs have no github.event.inputs; default seg
+          if [[ -z "${INPUT_MODE:-}" ]]; then
+            MODE="seg"
+          else
+            MODE="${INPUT_MODE}"
+          fi
+
+          if [[ "$MODE" != "seg" && "$MODE" != "metrics" ]]; then
+            echo "ERROR: phase3_mode must be 'seg' or 'metrics' (got: $MODE)"
+            exit 1
+          fi
 
           [[ -d "$RAWROOT" ]] || { echo "ERROR: $RAWROOT missing on data branch"; exit 1; }
 
@@ -120,6 +143,11 @@ jobs:
           echo "outmaster=$OUTMASTER" >> "$GITHUB_OUTPUT"
           echo "outframes=$OUTFRAMES" >> "$GITHUB_OUTPUT"
           echo "outdir=$OUTDIR" >> "$GITHUB_OUTPUT"
+          echo "phase3_mode=$MODE" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved DAY=$DAY"
+          echo "Resolved MODE=$MODE"
+          echo "Resolved INROOT=$INROOT"
 
       - name: Filter black frames (pre-stage)
         id: filter
@@ -185,7 +213,9 @@ jobs:
             --save-overlays
 
       # ============================================================
-      # Phase 3 (v2): Teacher -> Train -> Infer  (matches your local)
+      # Phase 3: Teacher -> Train -> Infer
+      #   - seg     : pixel-mask segmentation (recommended)
+      #   - metrics  : metric-supervised (optional)
       # ============================================================
 
       - name: Phase 3A - Build teacher masks + cloud_metrics.csv (baseline v2)
@@ -194,9 +224,6 @@ jobs:
           set -euo pipefail
           RAWDIR="${{ steps.resolve.outputs.outframes }}"
 
-          # Produces:
-          #   out/cloud_metrics.csv
-          #   out/masks/...
           python scripts/experiments/segmentation/cloud_mask_baseline_v2.py \
             --raw-dir "$RAWDIR" \
             --outdir out \
@@ -207,18 +234,40 @@ jobs:
           ls -la out/cloud_metrics.csv
           ls -la out/masks | head -n 20 || true
 
-          python - << 'PY'
-          import pandas as pd
-          df = pd.read_csv("out/cloud_metrics.csv")
-          cols = [c for c in df.columns if "cloud" in c.lower() and "fraction" in c.lower()]
-          print("cloud fraction cols:", cols)
-          if cols:
-              c = cols[0]
-              print(df[c].describe())
-              print("quantiles:", df[c].quantile([0.01,0.05,0.25,0.5,0.75,0.95,0.99]).to_dict())
-          PY
+      # -------------------------
+      # Phase 3B (seg mode)
+      # -------------------------
+      - name: Phase 3B (seg) - Train U-Net on pixel teacher masks
+        if: ${{ steps.resolve.outputs.phase3_mode == 'seg' }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Phase 3B - Train U-Net on teacher metrics
+          RAWDIR="${{ steps.resolve.outputs.outframes }}"
+
+          python ml/train_unet_pixelmask.py \
+            --frames-dir "$RAWDIR" \
+            --masks-dir out/masks \
+            --outdir out \
+            --epochs 30 \
+            --batch-size 4 \
+            --lr 3e-4 \
+            --base-ch 32 \
+            --bce-weight 0.5 \
+            --pos-weight 3 \
+            --split-by-time \
+            --image-size 256 \
+            --mask-threshold 128
+
+          echo "---- list seg models ----"
+          ls -la out/models | sed -n '1,120p'
+          test -f out/models/unet_pixelmask_latest.pt
+
+      # -------------------------
+      # Phase 3B (metrics mode)
+      # -------------------------
+      - name: Phase 3B (metrics) - Train U-Net on teacher metrics
+        if: ${{ steps.resolve.outputs.phase3_mode == 'metrics' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -236,104 +285,113 @@ jobs:
             --pos-weight auto \
             --split-by-time
 
-          echo "---- list models ----"
-          find out/models -type f -name "*.pt" -maxdepth 4 -print || true
+          echo "---- list metric models ----"
+          ls -la out/models | sed -n '1,120p'
+          test -f out/models/unet_cloudmask_latest.pt
 
-          python - <<'PY'
-          import torch
-          ckpt = torch.load("out/models/unet_cloudmask_latest.pt", map_location="cpu")
-          print("using run_id:", ckpt.get("config", {}).get("run_id", None))
-          print("pos_weight:", ckpt.get("config", {}).get("pos_weight", None))
-          print("use_disk_mask:", ckpt.get("config", {}).get("use_disk_mask", None))
-          PY
-
-      - name: Phase 3C - Resolve trained checkpoint from newest metrics (robust)
+      # -------------------------
+      # Phase 3C - Resolve checkpoint + set outputs for infer
+      # -------------------------
+      - name: Phase 3C - Resolve model path for inference (based on mode)
+        id: p3model
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "---- after training, list recent artifacts ----"
-          ls -lt out/models | head -n 80
+          MODE="${{ steps.resolve.outputs.phase3_mode }}"
+          echo "MODE=$MODE"
 
-          newest_metrics="$(ls -t out/models/*.metrics.csv | head -n 1)"
-          echo "Newest metrics: ${newest_metrics}"
+          if [[ "$MODE" == "seg" ]]; then
+            MODEL_PATH="out/models/unet_pixelmask_latest.pt"
+            OUTTAG="pixelmask"
+            USE_DISK="0"
+          else
+            MODEL_PATH="out/models/unet_cloudmask_latest.pt"
+            OUTTAG="metrics"
+            USE_DISK="1"
+          fi
 
-          ckpt="${newest_metrics%.metrics.csv}.pt"
-          echo "Using checkpoint: ${ckpt}"
-
-          if [[ ! -f "${ckpt}" ]]; then
-            echo "ERROR: checkpoint not found: ${ckpt}"
+          if [[ ! -f "$MODEL_PATH" ]]; then
+            echo "ERROR: expected model missing: $MODEL_PATH"
+            ls -la out/models || true
             exit 1
           fi
 
-          cp -f "${ckpt}" out/models/unet_cloudmask_latest.pt
-          echo "Wrote canonical checkpoint: out/models/unet_cloudmask_latest.pt"
+          echo "model_path=$MODEL_PATH" >> "$GITHUB_OUTPUT"
+          echo "outtag=$OUTTAG" >> "$GITHUB_OUTPUT"
+          echo "use_disk=$USE_DISK" >> "$GITHUB_OUTPUT"
 
-          ls -lh out/models/unet_cloudmask_latest.pt
+          echo "Resolved model_path=$MODEL_PATH"
+          echo "Resolved outtag=$OUTTAG"
+          echo "Resolved use_disk=$USE_DISK"
 
-      - name: Debug checkpoint identity
-        shell: bash
-        run: |
-          set -euo pipefail
-          ls -lh out/models
+          echo "---- checkpoint identity ----"
+          MODEL_PATH="$MODEL_PATH" python -c $'import os, torch\np=os.environ["MODEL_PATH"]\nckpt=torch.load(p, map_location="cpu")\nprint("ckpt type:", type(ckpt))\nif isinstance(ckpt, dict):\n    cfg=ckpt.get("config", {})\n    print("run_id:", cfg.get("run_id"))\n    print("use_disk_mask:", cfg.get("use_disk_mask"))\n    print("pos_weight:", cfg.get("pos_weight"))\n    print("bce_weight:", cfg.get("bce_weight"))\n'
 
-          python -c $'import torch\np="out/models/unet_cloudmask_latest.pt"\nprint("exists:", p)\nckpt=torch.load(p, map_location="cpu")\nprint("ckpt type:", type(ckpt))\nif isinstance(ckpt, dict):\n    cfg=ckpt.get("config", {})\n    print("run_id:", cfg.get("run_id"))\n    print("use_disk_mask:", cfg.get("use_disk_mask"))\n    print("pos_weight:", cfg.get("pos_weight"))\n    print("bce_weight:", cfg.get("bce_weight"))\n'
-
+      # -------------------------
+      # Phase 3D - Infer (multi-threshold) + debug pixel stats
+      #   - seg mode: no disk mask
+      #   - metrics mode: disk mask on
+      # -------------------------
       - name: Phase 3D - Infer masks (multi-threshold) + debug pixel stats
         shell: bash
         run: |
           set -euo pipefail
 
           DAY="${{ steps.resolve.outputs.day }}"
-          : "${DAY:?ERROR: steps.resolve.outputs.day is empty}"
-
           RAWDIR="${{ steps.resolve.outputs.outframes }}"
-          : "${RAWDIR:?ERROR: steps.resolve.outputs.outframes is empty}"
+          MODE="${{ steps.resolve.outputs.phase3_mode }}"
+          MODEL_PATH="${{ steps.p3model.outputs.model_path }}"
+          OUTTAG="${{ steps.p3model.outputs.outtag }}"
+          USE_DISK="${{ steps.p3model.outputs.use_disk }}"
 
           echo "DAY=$DAY"
           echo "RAWDIR=$RAWDIR"
-
-          ls -la "${{ steps.resolve.outputs.outmaster }}" || true
-          ls -la "$RAWDIR" || { echo "ERROR: frames dir not created yet: $RAWDIR"; exit 1; }
-
-          MODEL_PATH="out/models/unet_cloudmask_latest.pt"
-          test -f "$MODEL_PATH" || { echo "ERROR: missing checkpoint: $MODEL_PATH"; ls -la out/models || true; exit 1; }
-
+          echo "MODE=$MODE"
           echo "MODEL_PATH=$MODEL_PATH"
-          ls -la "$MODEL_PATH" || true
+          echo "OUTTAG=$OUTTAG"
+          echo "USE_DISK=$USE_DISK"
 
-          echo "---- checkpoint identity ----"
-          python -c $'import torch\np="out/models/unet_cloudmask_latest.pt"\nckpt=torch.load(p, map_location="cpu")\nprint("ckpt type:", type(ckpt))\nif isinstance(ckpt, dict):\n    cfg=ckpt.get("config", {})\n    print("run_id:", cfg.get("run_id"))\n    print("use_disk_mask:", cfg.get("use_disk_mask"))\n    print("pos_weight:", cfg.get("pos_weight"))\n    print("bce_weight:", cfg.get("bce_weight"))\n'
+          test -d "$RAWDIR" || { echo "ERROR: frames dir missing: $RAWDIR"; exit 1; }
+          test -f "$MODEL_PATH" || { echo "ERROR: model missing: $MODEL_PATH"; exit 1; }
 
-          # Always include 0.3 (your usual), plus higher thresholds to compare
           THRS="0.3 0.5 0.6 0.7 0.8"
-
-          # Canonical output for downstream steps (0.3)
-          CANON_OUT="out/$DAY/phase3_unet_v2_thr03_disk"
+          CANON_OUT="out/$DAY/phase3_unet_${OUTTAG}_thr03"
 
           for T in $THRS; do
-            OUTDIR="out/$DAY/phase3_unet_v2_thr${T/./}_disk"
+            OUTDIR="out/$DAY/phase3_unet_${OUTTAG}_thr${T/./}"
             echo "---- infer threshold=$T -> $OUTDIR ----"
             mkdir -p "$OUTDIR"
 
-            python ml/infer_unet_masks.py \
-              --frames "$RAWDIR" \
-              --outdir "$OUTDIR" \
-              --ckpt "$MODEL_PATH" \
-              --recursive \
-              --threshold "$T" \
-              --image-size 256 \
-              --device cpu \
-              --use-disk-mask \
-              --disk-thresh 0.02
+            if [[ "$USE_DISK" == "1" ]]; then
+              python ml/infer_unet_masks.py \
+                --frames "$RAWDIR" \
+                --outdir "$OUTDIR" \
+                --ckpt "$MODEL_PATH" \
+                --recursive \
+                --threshold "$T" \
+                --image-size 256 \
+                --device cpu \
+                --use-disk-mask \
+                --disk-thresh 0.02
+            else
+              python ml/infer_unet_masks.py \
+                --frames "$RAWDIR" \
+                --outdir "$OUTDIR" \
+                --ckpt "$MODEL_PATH" \
+                --recursive \
+                --threshold "$T" \
+                --image-size 256 \
+                --device cpu
+            fi
 
             OUTDIR="$OUTDIR" python -c $'from pathlib import Path\nimport os\nimport numpy as np\nfrom PIL import Image\n\noutdir = Path(os.environ["OUTDIR"]) / "masks_unet"\nfiles = sorted(outdir.glob("*.png"))\nprint("masks_unet:", outdir)\nprint("count:", len(files))\nif not files:\n    raise SystemExit("No mask PNGs found.")\n\nfor f in files[:5]:\n    a = np.array(Image.open(f).convert("L"))\n    white = (a >= 128).mean() * 100.0\n    print(f.name, "shape", a.shape, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))\n'
 
-            ls -la "$OUTDIR" || true
             ls -la "$OUTDIR/masks_unet" | head -n 10 || true
             ls -la "$OUTDIR/cloud_metrics_unet.csv" || true
           done
 
+          # canonical = thr03
           test -d "$CANON_OUT/masks_unet" || { echo "ERROR: canonical output missing: $CANON_OUT/masks_unet"; exit 1; }
 
           CANON_OUT="$CANON_OUT" python -c $'from pathlib import Path\nimport os\nimport numpy as np\nfrom PIL import Image\n\noutdir = Path(os.environ["CANON_OUT"]) / "masks_unet"\nmasks = sorted(outdir.glob("*.png"))[:10]\nprint("canonical check:", outdir)\nprint("checking", len(masks), "masks")\nif not masks:\n    raise SystemExit("No canonical mask PNGs found.")\n\nbad = 0\nfor p in masks:\n    a = np.array(Image.open(p).convert("L"))\n    if a.max() == 0:\n        bad += 1\n    print(p.name, "min/max", int(a.min()), int(a.max()), "white%:", float((a > 0).mean() * 100.0))\n\nif bad == len(masks):\n    raise SystemExit("All checked canonical masks are empty (all black). Failing.")\n'
@@ -341,12 +399,12 @@ jobs:
       - name: Upload Phase 3 outputs (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: phase3_unet_v2_${{ steps.resolve.outputs.day }}
+          name: phase3_${{ steps.resolve.outputs.phase3_mode }}_${{ steps.resolve.outputs.day }}
           path: |
-            out/${{ steps.resolve.outputs.day }}/phase3_unet_v2_thr03_disk
+            out/${{ steps.resolve.outputs.day }}/phase3_unet_${{ steps.p3model.outputs.outtag }}_thr03
             out/cloud_metrics.csv
             out/masks
-            out/models/unet_cloudmask_latest.pt
+            out/models
 
       - name: Commit results to data
         shell: bash
@@ -355,7 +413,7 @@ jobs:
           DAY="${{ steps.resolve.outputs.day }}"
 
           git add -f data/raw out || true
-          git commit -m "daily rollup + phase2 + phase3(v2 teacher->train->infer): $DAY" || echo "No changes"
+          git commit -m "daily rollup + phase2 + phase3(mode=${{ steps.resolve.outputs.phase3_mode }}): $DAY" || echo "No changes"
           git push origin data
 
 
