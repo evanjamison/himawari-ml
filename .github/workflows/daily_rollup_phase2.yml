@@ -565,6 +565,44 @@ jobs:
           ls -la out/models | grep -i convlstm || true
           ls -la out/viz    | grep -i convlstm || true
 
+      - name: Phase 4C - Evaluate ConvLSTM rollouts (closed-loop)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DAY="${{ steps.resolve.outputs.day }}"
+          METRICS="${{ steps.p4csv.outputs.metrics_csv }}"
+
+          test -f "$METRICS" || { echo "ERROR: missing metrics csv: $METRICS"; exit 1; }
+
+          # If you trained RGB, swap to convlstm_ss_best_rgb.pt
+          CKPT="out/models/convlstm_ss_best_gray.pt"
+          test -f "$CKPT" || { echo "ERROR: missing ConvLSTM ckpt: $CKPT"; ls -la out/models | grep convlstm || true; exit 1; }
+
+          OUTDIR="out/$DAY/phase4_convlstm/rollout_eval"
+          mkdir -p "$OUTDIR"
+
+          python -u ml/eval_convlstm_rollout.py \
+            --metrics-csv "$METRICS" \
+            --ckpt "$CKPT" \
+            --outdir "$OUTDIR" \
+            --seq-len 6 \
+            --rollout-k 2 \
+            --thr 0.30 \
+            --feedback prob \
+            --val-frac 0.20 \
+            --viz-samples 3 \
+            --viz-evenly-spaced \
+            --device cpu
+
+          echo "---- rollout outputs ----"
+          ls -la "$OUTDIR"
+          echo "---- summary (head) ----"
+          python - <<'PY'
+          import pandas as pd
+          df = pd.read_csv("out/${{ steps.resolve.outputs.day }}/phase4_convlstm/rollout_eval/rollout_summary.csv")
+          print(df)
+          PY
 
 
       - name: Upload Phase 3/4 outputs (artifact)
@@ -572,13 +610,28 @@ jobs:
         with:
           name: rollup_${{ steps.resolve.outputs.day }}
           path: |
+            # Phase 2 outputs
             out/${{ steps.resolve.outputs.day }}/daily
+
+            # Phase 3 outputs (canonical thr03 for whichever outtag you trained)
             out/${{ steps.resolve.outputs.day }}/phase3_unet_${{ steps.p3train.outputs.outtag }}_thr03
+
+            # Phase 4 metrics + training outputs
             out/${{ steps.resolve.outputs.day }}/phase4_convlstm
+
+            # Phase 4C rollout eval outputs (new)
+            out/${{ steps.resolve.outputs.day }}/phase4_convlstm/rollout_eval/rollout_metrics.csv
+            out/${{ steps.resolve.outputs.day }}/phase4_convlstm/rollout_eval/rollout_summary.csv
+            out/${{ steps.resolve.outputs.day }}/phase4_convlstm/rollout_eval/rollout_contact_sheet.png
+
+            # Teacher (baseline) artifacts
             out/cloud_metrics.csv
             out/masks
+
+            # Models + visualizations (includes unet + convlstm ckpts and curves)
             out/models
             out/viz
+
 
       - name: Commit results to data (rebase-safe)
         shell: bash
