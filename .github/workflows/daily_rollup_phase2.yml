@@ -493,6 +493,15 @@ jobs:
           METRICS="${{ steps.p4csv.outputs.metrics_csv }}"
           test -f "$METRICS" || { echo "ERROR: missing ConvLSTM metrics csv: $METRICS"; exit 1; }
 
+          echo "---- ConvLSTM metrics sanity ----"
+          python - <<'PY'
+          import pandas as pd
+          df = pd.read_csv("${METRICS}")
+          print("rows:", len(df))
+          print("head:", df.head(2).to_dict(orient="records"))
+          print("tail:", df.tail(2).to_dict(orient="records"))
+          PY
+
           USE_RGB="${{ github.event.inputs.convlstm_use_rgb }}"
           SEQ_LEN="${{ github.event.inputs.convlstm_seq_len }}"
           K="${{ github.event.inputs.convlstm_rollout_k }}"
@@ -504,8 +513,36 @@ jobs:
           echo "K=$K"
           echo "EPOCHS=$EPOCHS"
 
+          # -----------------------------
+          # SMOKE RUN (fast, proves liveness)
+          # -----------------------------
+          echo "---- SMOKE RUN (epochs=1, rollout_k=1) ----"
           if [[ "$USE_RGB" == "1" ]]; then
-            python ml/train_convlstm.py \
+            python -u ml/train_convlstm.py \
+              --metrics-csv "$METRICS" \
+              --outdir out \
+              --seq-len "$SEQ_LEN" \
+              --rollout-k 1 \
+              --epochs 1 \
+              --batch-size 2 \
+              --use-rgb
+          else
+            python -u ml/train_convlstm.py \
+              --metrics-csv "$METRICS" \
+              --outdir out \
+              --seq-len "$SEQ_LEN" \
+              --rollout-k 1 \
+              --epochs 1 \
+              --batch-size 2
+          fi
+
+          # -----------------------------
+          # REAL RUN (keep it practical on CPU)
+          # Default-recommendation: rollout_k=1, epochs<=6
+          # -----------------------------
+          echo "---- REAL RUN ----"
+          if [[ "$USE_RGB" == "1" ]]; then
+            python -u ml/train_convlstm.py \
               --metrics-csv "$METRICS" \
               --outdir out \
               --seq-len "$SEQ_LEN" \
@@ -514,7 +551,7 @@ jobs:
               --batch-size 2 \
               --use-rgb
           else
-            python ml/train_convlstm.py \
+            python -u ml/train_convlstm.py \
               --metrics-csv "$METRICS" \
               --outdir out \
               --seq-len "$SEQ_LEN" \
@@ -524,8 +561,9 @@ jobs:
           fi
 
           echo "---- convlstm outputs ----"
-          ls -la out/models | grep convlstm || true
-          ls -la out/viz | grep convlstm || true
+          ls -la out/models | grep -i convlstm || true
+          ls -la out/viz    | grep -i convlstm || true
+
 
       - name: Upload Phase 3/4 outputs (artifact)
         uses: actions/upload-artifact@v4
