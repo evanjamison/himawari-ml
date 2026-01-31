@@ -275,18 +275,21 @@ jobs:
 
           else
             # pixel-mask segmentation training (disk mask OFF)
-            # (expects train_unet_pixelmask.py to exist in ml/)
+            # IMPORTANT:
+            #  - train_unet_pixelmask.py expects --frames-dir and --masks-dir
+            #  - it does NOT support --pos-weight auto (must be float)
             python ml/train_unet_pixelmask.py \
-              --raw-dir "${{ steps.resolve.outputs.outframes }}" \
-              --teacher-masks-dir out/masks \
+              --frames-dir "${{ steps.resolve.outputs.outframes }}" \
+              --masks-dir  out/masks \
               --outdir out \
+              --image-size 256 \
               --epochs 30 \
               --batch-size 4 \
               --lr 3e-4 \
               --base-ch 32 \
               --augment \
               --bce-weight 0.5 \
-              --pos-weight auto \
+              --pos-weight 3.0 \
               --split-by-time
 
             echo "model_path=out/models/unet_pixelmask_latest.pt" >> "$GITHUB_OUTPUT"
@@ -296,6 +299,7 @@ jobs:
 
           echo "---- list models ----"
           ls -la out/models | head -n 200 || true
+
 
       - name: Phase 3C - Debug checkpoint identity
         shell: bash
