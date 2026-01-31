@@ -6,14 +6,13 @@ import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import numpy as np
 from PIL import Image
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 
@@ -27,69 +26,71 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def is_image_file(p: Path) -> bool:
-    return p.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
+
 def list_images_recursive(root: Path) -> List[Path]:
-    files = []
+    files: List[Path] = []
     for ext in ("*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff"):
         files.extend(root.rglob(ext))
     return sorted(files)
 
+
 def read_grayscale(p: Path) -> np.ndarray:
-    # returns HxW uint8
-    im = Image.open(p).convert("L")
-    return np.array(im)
+    return np.array(Image.open(p).convert("L"))
+
 
 def read_rgb(p: Path) -> np.ndarray:
-    # returns HxWx3 uint8
-    im = Image.open(p).convert("RGB")
-    return np.array(im)
+    return np.array(Image.open(p).convert("RGB"))
 
 
 # ---------------------------
-# Simple U-Net
+# Simple U-Net (key-compatible with infer_unet_masks.py)
+# IMPORTANT:
+#   enc1/enc2/... are nn.Sequential so state_dict keys are enc1.0.weight etc.
+#   This matches your existing ml/infer_unet_masks.py expectations.
 # ---------------------------
 
-class DoubleConv(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
+def conv_block(in_ch: int, out_ch: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+    )
 
-    def forward(self, x):
-        return self.net(x)
 
 class UNet(nn.Module):
     def __init__(self, in_ch: int = 3, base_ch: int = 32):
         super().__init__()
-        self.enc1 = DoubleConv(in_ch, base_ch)
+
+        self.enc1 = conv_block(in_ch, base_ch)
         self.pool1 = nn.MaxPool2d(2)
-        self.enc2 = DoubleConv(base_ch, base_ch * 2)
+
+        self.enc2 = conv_block(base_ch, base_ch * 2)
         self.pool2 = nn.MaxPool2d(2)
-        self.enc3 = DoubleConv(base_ch * 2, base_ch * 4)
+
+        self.enc3 = conv_block(base_ch * 2, base_ch * 4)
         self.pool3 = nn.MaxPool2d(2)
-        self.enc4 = DoubleConv(base_ch * 4, base_ch * 8)
+
+        self.enc4 = conv_block(base_ch * 4, base_ch * 8)
 
         self.up3 = nn.ConvTranspose2d(base_ch * 8, base_ch * 4, 2, stride=2)
-        self.dec3 = DoubleConv(base_ch * 8, base_ch * 4)
+        self.dec3 = conv_block(base_ch * 8, base_ch * 4)
+
         self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 2, stride=2)
-        self.dec2 = DoubleConv(base_ch * 4, base_ch * 2)
+        self.dec2 = conv_block(base_ch * 4, base_ch * 2)
+
         self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, 2, stride=2)
-        self.dec1 = DoubleConv(base_ch * 2, base_ch)
+        self.dec1 = conv_block(base_ch * 2, base_ch)
 
         self.out = nn.Conv2d(base_ch, 1, kernel_size=1)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool1(e1))
         e3 = self.enc3(self.pool2(e2))
@@ -115,15 +116,17 @@ class UNet(nn.Module):
 # ---------------------------
 
 def dice_loss_from_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    # logits: (B,1,H,W), targets: (B,1,H,W) in {0,1}
     probs = torch.sigmoid(logits)
     num = 2 * (probs * targets).sum(dim=(2, 3))
     den = (probs + targets).sum(dim=(2, 3)) + eps
     dice = num / den
     return 1.0 - dice.mean()
 
+
 @torch.no_grad()
-def dice_iou_from_logits(logits: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5, eps: float = 1e-6) -> Tuple[float, float]:
+def dice_iou_from_logits(
+    logits: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5, eps: float = 1e-6
+) -> Tuple[float, float]:
     probs = torch.sigmoid(logits)
     preds = (probs >= threshold).float()
     inter = (preds * targets).sum(dim=(2, 3))
@@ -143,15 +146,18 @@ class Pair:
     mask: Path
     key: str
 
+
 class FrameMaskDataset(Dataset):
     """
     Expects:
       frames_dir: contains RGB images (*.png)
       masks_dir : contains corresponding mask PNGs
+
     Matching rule:
-      mask filename contains the frame stem OR is stem + "_mask"
-      Recommended: frame "himawari_...Z.png"  mask "himawari_...Z_mask.png"
+      mask filename matches frame stem, or stem + "_mask"
+      Recommended: frame "himawari_...Z.png" <-> mask "himawari_...Z_mask.png"
     """
+
     def __init__(
         self,
         frames_dir: Path,
@@ -170,7 +176,6 @@ class FrameMaskDataset(Dataset):
         frame_files = list_images_recursive(frames_dir) if recursive else sorted(frames_dir.glob("*.png"))
         mask_files = list_images_recursive(masks_dir) if recursive else sorted(masks_dir.glob("*.png"))
 
-        # Map masks by stem and also by "stem without _mask"
         mask_map = {}
         for m in mask_files:
             s = m.stem
@@ -181,15 +186,12 @@ class FrameMaskDataset(Dataset):
         pairs: List[Pair] = []
         for f in frame_files:
             stem = f.stem
-            m = mask_map.get(stem)
-            if m is None:
-                # try explicit
-                m = mask_map.get(stem + "_mask")
+            m = mask_map.get(stem) or mask_map.get(stem + "_mask")
             if m is None:
                 continue
             pairs.append(Pair(img=f, mask=m, key=stem))
 
-        if len(pairs) == 0:
+        if not pairs:
             raise RuntimeError(
                 f"No frame/mask pairs found.\nframes_dir={frames_dir}\nmasks_dir={masks_dir}\n"
                 f"Expected matching stems like frame.png <-> frame_mask.png"
@@ -207,17 +209,16 @@ class FrameMaskDataset(Dataset):
         return np.array(pil)
 
     def _augment(self, x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        # x: HxWx3, y: HxW
         if not self.augment:
             return x, y
-        # flips
+
         if random.random() < 0.5:
             x = np.flip(x, axis=1).copy()
             y = np.flip(y, axis=1).copy()
         if random.random() < 0.5:
             x = np.flip(x, axis=0).copy()
             y = np.flip(y, axis=0).copy()
-        # 90 deg rotations
+
         k = random.randint(0, 3)
         if k:
             x = np.rot90(x, k, axes=(0, 1)).copy()
@@ -226,17 +227,15 @@ class FrameMaskDataset(Dataset):
 
     def __getitem__(self, idx: int):
         pair = self.pairs[idx]
-        x = read_rgb(pair.img)          # uint8
-        y = read_grayscale(pair.mask)   # uint8
+        x = read_rgb(pair.img)         # uint8 HxWx3
+        y = read_grayscale(pair.mask)  # uint8 HxW
 
         x = self._resize(x, is_mask=False)
         y = self._resize(y, is_mask=True)
 
         x, y = self._augment(x, y)
 
-        # Normalize to [0,1]
         x = (x.astype(np.float32) / 255.0).transpose(2, 0, 1)  # 3xHxW
-        # Binarize mask
         y = (y.astype(np.uint8) >= self.threshold).astype(np.float32)[None, :, :]  # 1xHxW
 
         return torch.from_numpy(x), torch.from_numpy(y), pair.key
@@ -247,7 +246,6 @@ class FrameMaskDataset(Dataset):
 # ---------------------------
 
 def split_by_time(pairs: List[Pair], val_frac: float = 0.2) -> Tuple[List[int], List[int]]:
-    # Sort by key string; for Himawari timestamps in name this approximates time order.
     idxs = list(range(len(pairs)))
     idxs.sort(key=lambda i: pairs[i].key)
     n = len(idxs)
@@ -255,6 +253,7 @@ def split_by_time(pairs: List[Pair], val_frac: float = 0.2) -> Tuple[List[int], 
     val = idxs[-n_val:]
     train = idxs[:-n_val]
     return train, val
+
 
 def split_random(n: int, val_frac: float = 0.2, seed: int = 0) -> Tuple[List[int], List[int]]:
     rng = random.Random(seed)
@@ -265,6 +264,7 @@ def split_random(n: int, val_frac: float = 0.2, seed: int = 0) -> Tuple[List[int
     train = idxs[n_val:]
     return train, val
 
+
 def save_preview_grid(
     out_path: Path,
     keys: List[str],
@@ -274,8 +274,8 @@ def save_preview_grid(
     threshold: float = 0.5,
     max_items: int = 8,
 ):
-    # Creates a simple contact sheet: (input, GT, pred)
-    from PIL import ImageDraw, ImageFont
+    # Simple contact sheet: (input, GT, pred)
+    from PIL import ImageDraw
 
     xs = xs[:max_items].cpu().numpy()
     ys = ys[:max_items].cpu().numpy()
@@ -292,7 +292,6 @@ def save_preview_grid(
         gt_img = Image.fromarray(gt).convert("RGB")
         pr_img = Image.fromarray(pr).convert("RGB")
 
-        # label strip
         strip_h = 18
         strip = Image.new("RGB", (x_img.width * 3, strip_h), (20, 20, 20))
         draw = ImageDraw.Draw(strip)
@@ -359,10 +358,11 @@ def main():
     ensure_dir(models_dir)
     ensure_dir(viz_dir)
 
-    device = "cpu"
     if args.device == "cuda":
         device = "cuda"
-    elif args.device == "auto":
+    elif args.device == "cpu":
+        device = "cpu"
+    else:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     ds = FrameMaskDataset(
@@ -387,7 +387,6 @@ def main():
 
     model = UNet(in_ch=3, base_ch=args.base_ch).to(device)
 
-    # Loss parts
     pos_weight = torch.tensor([args.pos_weight], device=device)
     bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
@@ -395,7 +394,13 @@ def main():
     best_val = float("inf")
 
     run_id = f"unet_pixelmask_{frames_dir.name}_{args.image_size}px_seed{args.seed}"
-    cfg = vars(args) | {"run_id": run_id, "device_resolved": device, "n_pairs": len(ds), "n_train": len(train_ds), "n_val": len(val_ds)}
+    cfg = vars(args) | {
+        "run_id": run_id,
+        "device_resolved": device,
+        "n_pairs": len(ds),
+        "n_train": len(train_ds),
+        "n_val": len(val_ds),
+    }
 
     (models_dir / f"{run_id}.config.json").write_text(json.dumps(cfg, indent=2))
 
@@ -404,9 +409,7 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        tr_losses = []
-        tr_dice = []
-        tr_iou = []
+        tr_losses, tr_dice, tr_iou = [], [], []
 
         for x, y, _ in train_loader:
             x = x.to(device, non_blocking=True)
@@ -423,16 +426,12 @@ def main():
             opt.step()
 
             d, i = dice_iou_from_logits(logits.detach(), y, threshold=args.threshold_eval)
-
             tr_losses.append(loss.item())
             tr_dice.append(d)
             tr_iou.append(i)
 
-        # val
         model.eval()
-        va_losses = []
-        va_dice = []
-        va_iou = []
+        va_losses, va_dice, va_iou = [], [], []
         preview_batch = None
 
         with torch.no_grad():
@@ -447,13 +446,12 @@ def main():
                 loss = ld + args.bce_weight * lb
 
                 d, i = dice_iou_from_logits(logits, y, threshold=args.threshold_eval)
-
                 va_losses.append(loss.item())
                 va_dice.append(d)
                 va_iou.append(i)
 
                 if preview_batch is None:
-                    preview_batch = (keys, x.detach().cpu(), y.detach().cpu(), logits.detach().cpu())
+                    preview_batch = (list(keys), x.detach().cpu(), y.detach().cpu(), logits.detach().cpu())
 
         tr_loss = float(np.mean(tr_losses)) if tr_losses else float("nan")
         va_loss = float(np.mean(va_losses)) if va_losses else float("nan")
@@ -468,19 +466,17 @@ def main():
             f"val loss {va_loss:.4f} dice {va_d:.3f} iou {va_i:.3f}"
         )
 
-        # save preview
         if preview_batch is not None:
             keys, xcpu, ycpu, lcpu = preview_batch
             save_preview_grid(
                 viz_dir / f"{run_id}_val_preview_epoch{epoch:02d}.png",
-                list(keys),
+                keys,
                 xcpu,
                 ycpu,
                 lcpu,
                 threshold=args.threshold_eval,
             )
 
-        # checkpoint
         if va_loss < best_val:
             best_val = va_loss
             ckpt_path = models_dir / f"{run_id}.pt"
@@ -502,3 +498,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
