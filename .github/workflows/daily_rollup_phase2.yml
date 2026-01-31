@@ -420,9 +420,26 @@ jobs:
           set -euo pipefail
           DAY="${{ steps.resolve.outputs.day }}"
 
+          # Stage outputs
           git add -f data/raw out || true
-          git commit -m "daily rollup + phase2 + phase3(mode=${{ steps.resolve.outputs.phase3_mode }}): $DAY" || echo "No changes"
-          git push origin data
+
+          # Commit if there are changes
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "daily rollup + phase2 + phase3(mode=${{ steps.resolve.outputs.phase3_mode }}): $DAY"
+
+          # ✅ KEY FIX: sync with remote data branch before push (handles concurrent runs)
+          git fetch origin data
+
+          # Rebase our new commit(s) on top of the latest remote data
+          # (safe here because this branch is bot-generated artifacts)
+          git rebase origin/data
+
+          # Push our rebased HEAD back to data
+          git push origin HEAD:data
 
 
 
