@@ -330,8 +330,8 @@ jobs:
 
       # -------------------------
       # Phase 3D - Infer (multi-threshold) + debug pixel stats
-      #   - seg mode: no disk mask
-      #   - metrics mode: disk mask on
+      #   - seg mode: uses ml/infer_unet_pixelmask.py (no disk mask)
+      #   - metrics mode: uses ml/infer_unet_masks.py (disk mask on)
       # -------------------------
       - name: Phase 3D - Infer masks (multi-threshold) + debug pixel stats
         shell: bash
@@ -355,6 +355,11 @@ jobs:
           test -d "$RAWDIR" || { echo "ERROR: frames dir missing: $RAWDIR"; exit 1; }
           test -f "$MODEL_PATH" || { echo "ERROR: model missing: $MODEL_PATH"; exit 1; }
 
+          # Ensure seg-mode infer script exists when needed
+          if [[ "$USE_DISK" != "1" ]]; then
+            test -f "ml/infer_unet_pixelmask.py" || { echo "ERROR: missing ml/infer_unet_pixelmask.py (required for seg mode)"; ls -la ml || true; exit 1; }
+          fi
+
           THRS="0.3 0.5 0.6 0.7 0.8"
           CANON_OUT="out/$DAY/phase3_unet_${OUTTAG}_thr03"
 
@@ -364,6 +369,7 @@ jobs:
             mkdir -p "$OUTDIR"
 
             if [[ "$USE_DISK" == "1" ]]; then
+              # metrics-mode infer (existing script, expects UNet4-style ckpt)
               python ml/infer_unet_masks.py \
                 --frames "$RAWDIR" \
                 --outdir "$OUTDIR" \
@@ -375,7 +381,8 @@ jobs:
                 --use-disk-mask \
                 --disk-thresh 0.02
             else
-              python ml/infer_unet_masks.py \
+              # seg-mode infer (new script, matches train_unet_pixelmask.py ckpt)
+              python ml/infer_unet_pixelmask.py \
                 --frames "$RAWDIR" \
                 --outdir "$OUTDIR" \
                 --ckpt "$MODEL_PATH" \
@@ -395,6 +402,7 @@ jobs:
           test -d "$CANON_OUT/masks_unet" || { echo "ERROR: canonical output missing: $CANON_OUT/masks_unet"; exit 1; }
 
           CANON_OUT="$CANON_OUT" python -c $'from pathlib import Path\nimport os\nimport numpy as np\nfrom PIL import Image\n\noutdir = Path(os.environ["CANON_OUT"]) / "masks_unet"\nmasks = sorted(outdir.glob("*.png"))[:10]\nprint("canonical check:", outdir)\nprint("checking", len(masks), "masks")\nif not masks:\n    raise SystemExit("No canonical mask PNGs found.")\n\nbad = 0\nfor p in masks:\n    a = np.array(Image.open(p).convert("L"))\n    if a.max() == 0:\n        bad += 1\n    print(p.name, "min/max", int(a.min()), int(a.max()), "white%:", float((a > 0).mean() * 100.0))\n\nif bad == len(masks):\n    raise SystemExit("All checked canonical masks are empty (all black). Failing.")\n'
+
 
       - name: Upload Phase 3 outputs (artifact)
         uses: actions/upload-artifact@v4
