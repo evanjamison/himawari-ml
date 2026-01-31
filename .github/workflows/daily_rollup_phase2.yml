@@ -10,9 +10,29 @@ on:
         required: false
         default: ""
       phase3_mode:
-        description: "Phase 3 training mode: 'seg' (pixel-mask segmentation) or 'metrics' (metric-supervised)."
+        description: "Phase 3 mode: metrics (teacher->train->infer) or seg (pixel-mask U-Net)."
         required: false
         default: "seg"
+      enable_phase4:
+        description: "Run Phase 4 ConvLSTM training (1=yes, 0=no)."
+        required: false
+        default: "1"
+      convlstm_use_rgb:
+        description: "ConvLSTM input includes RGB frames (1=yes) vs grayscale (0=no)."
+        required: false
+        default: "0"
+      convlstm_seq_len:
+        description: "ConvLSTM sequence length (T)."
+        required: false
+        default: "6"
+      convlstm_rollout_k:
+        description: "ConvLSTM rollout steps (K)."
+        required: false
+        default: "2"
+      convlstm_epochs:
+        description: "ConvLSTM epochs."
+        required: false
+        default: "20"
 
 permissions:
   contents: write
@@ -47,20 +67,19 @@ jobs:
           git fetch origin main --depth=1
           git checkout origin/main -- src scripts ml requirements.txt pyproject.toml || true
 
-          echo "---- verify filter_black_frames.py exists ----"
+          echo "---- verify key scripts exist ----"
           ls -la scripts/pipeline/filter_black_frames.py
-
-          echo "---- verify teacher baseline exists ----"
+          ls -la scripts/pipeline/run_sample_pipeline.py
           ls -la scripts/experiments/segmentation/cloud_mask_baseline_v2.py
 
-          echo "---- verify metric-mode trainer exists ----"
+          echo "---- verify phase3 trainers/infer exist ----"
           ls -la ml/train_unet.py
-
-          echo "---- verify seg-mode trainer exists ----"
-          ls -la ml/train_unet_pixelmask.py
-
-          echo "---- verify infer exists ----"
+          ls -la ml/train_unet_pixelmask.py || true
           ls -la ml/infer_unet_masks.py
+          ls -la ml/infer_unet_pixelmask.py || true
+
+          echo "---- verify convlstm trainer exists ----"
+          ls -la ml/train_convlstm.py || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -74,10 +93,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -e .
-          # ✅ baseline v2 imports cv2; use headless OpenCV on GH runners
+          # baseline v2 imports cv2; use headless OpenCV on GH runners
           pip install opencv-python-headless
 
-      - name: Resolve DAY + input roots + Phase3 mode
+      - name: Resolve DAY + input roots + Phase 3 mode
         id: resolve
         shell: bash
         run: |
@@ -85,23 +104,11 @@ jobs:
 
           RAWROOT="data/raw"
           INPUT_DAY="${{ github.event.inputs.day }}"
-          INPUT_MODE="${{ github.event.inputs.phase3_mode }}"
+          MODE_IN="${{ github.event.inputs.phase3_mode }}"
 
           norm_day() {
             [[ "$1" =~ ^[0-9]{8}$ ]] && echo "${1:0:4}-${1:4:2}-${1:6:2}" || echo "$1"
           }
-
-          # schedule runs have no github.event.inputs; default seg
-          if [[ -z "${INPUT_MODE:-}" ]]; then
-            MODE="seg"
-          else
-            MODE="${INPUT_MODE}"
-          fi
-
-          if [[ "$MODE" != "seg" && "$MODE" != "metrics" ]]; then
-            echo "ERROR: phase3_mode must be 'seg' or 'metrics' (got: $MODE)"
-            exit 1
-          fi
 
           [[ -d "$RAWROOT" ]] || { echo "ERROR: $RAWROOT missing on data branch"; exit 1; }
 
@@ -133,6 +140,10 @@ jobs:
             exit 1
           fi
 
+          # normalize mode
+          MODE="seg"
+          if [[ "$MODE_IN" == "metrics" ]]; then MODE="metrics"; fi
+
           OUTMASTER="$DAYDIR/master"
           OUTFRAMES="$OUTMASTER/frames"
           OUTDIR="out/$DAY/daily"
@@ -148,6 +159,7 @@ jobs:
           echo "Resolved DAY=$DAY"
           echo "Resolved MODE=$MODE"
           echo "Resolved INROOT=$INROOT"
+          echo "Resolved DAYDIR=$DAYDIR"
 
       - name: Filter black frames (pre-stage)
         id: filter
@@ -213,9 +225,9 @@ jobs:
             --save-overlays
 
       # ============================================================
-      # Phase 3: Teacher -> Train -> Infer
-      #   - seg     : pixel-mask segmentation (recommended)
-      #   - metrics  : metric-supervised (optional)
+      # Phase 3: branchable mode
+      #   metrics: baseline_v2 -> train_unet.py -> infer_unet_masks.py (disk mask ON)
+      #   seg:     baseline_v2 -> train_unet_pixelmask.py -> infer_unet_pixelmask.py (disk mask OFF)
       # ============================================================
 
       - name: Phase 3A - Build teacher masks + cloud_metrics.csv (baseline v2)
@@ -234,106 +246,87 @@ jobs:
           ls -la out/cloud_metrics.csv
           ls -la out/masks | head -n 20 || true
 
-      # -------------------------
-      # Phase 3B (seg mode)
-      # -------------------------
-      - name: Phase 3B (seg) - Train U-Net on pixel teacher masks
-        if: ${{ steps.resolve.outputs.phase3_mode == 'seg' }}
+      - name: Phase 3B - Train model (metrics OR seg)
+        id: p3train
         shell: bash
         run: |
           set -euo pipefail
-
-          RAWDIR="${{ steps.resolve.outputs.outframes }}"
-
-          python ml/train_unet_pixelmask.py \
-            --frames-dir "$RAWDIR" \
-            --masks-dir out/masks \
-            --outdir out \
-            --epochs 30 \
-            --batch-size 4 \
-            --lr 3e-4 \
-            --base-ch 32 \
-            --bce-weight 0.5 \
-            --pos-weight 3 \
-            --split-by-time \
-            --image-size 256 \
-            --mask-threshold 128
-
-          echo "---- list seg models ----"
-          ls -la out/models | sed -n '1,120p'
-          test -f out/models/unet_pixelmask_latest.pt
-
-      # -------------------------
-      # Phase 3B (metrics mode)
-      # -------------------------
-      - name: Phase 3B (metrics) - Train U-Net on teacher metrics
-        if: ${{ steps.resolve.outputs.phase3_mode == 'metrics' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python ml/train_unet.py \
-            --metrics-csv out/cloud_metrics.csv \
-            --outdir out \
-            --epochs 30 \
-            --batch-size 4 \
-            --lr 3e-4 \
-            --base-ch 32 \
-            --augment \
-            --bce-weight 0.1 \
-            --use-disk-mask \
-            --pos-weight auto \
-            --split-by-time
-
-          echo "---- list metric models ----"
-          ls -la out/models | sed -n '1,120p'
-          test -f out/models/unet_cloudmask_latest.pt
-
-      # -------------------------
-      # Phase 3C - Resolve checkpoint + set outputs for infer
-      # -------------------------
-      - name: Phase 3C - Resolve model path for inference (based on mode)
-        id: p3model
-        shell: bash
-        run: |
-          set -euo pipefail
-
           MODE="${{ steps.resolve.outputs.phase3_mode }}"
-          echo "MODE=$MODE"
+          echo "Phase3 MODE=$MODE"
 
-          if [[ "$MODE" == "seg" ]]; then
-            MODEL_PATH="out/models/unet_pixelmask_latest.pt"
-            OUTTAG="pixelmask"
-            USE_DISK="0"
+          if [[ "$MODE" == "metrics" ]]; then
+            # teacher-metrics training (disk mask ON)
+            python ml/train_unet.py \
+              --metrics-csv out/cloud_metrics.csv \
+              --outdir out \
+              --epochs 30 \
+              --batch-size 4 \
+              --lr 3e-4 \
+              --base-ch 32 \
+              --augment \
+              --bce-weight 0.1 \
+              --use-disk-mask \
+              --pos-weight auto \
+              --split-by-time
+
+            echo "model_path=out/models/unet_cloudmask_latest.pt" >> "$GITHUB_OUTPUT"
+            echo "outtag=cloudmask" >> "$GITHUB_OUTPUT"
+            echo "use_disk=1" >> "$GITHUB_OUTPUT"
+
           else
-            MODEL_PATH="out/models/unet_cloudmask_latest.pt"
-            OUTTAG="metrics"
-            USE_DISK="1"
+            # pixel-mask segmentation training (disk mask OFF)
+            # (expects train_unet_pixelmask.py to exist in ml/)
+            python ml/train_unet_pixelmask.py \
+              --raw-dir "${{ steps.resolve.outputs.outframes }}" \
+              --teacher-masks-dir out/masks \
+              --outdir out \
+              --epochs 30 \
+              --batch-size 4 \
+              --lr 3e-4 \
+              --base-ch 32 \
+              --augment \
+              --bce-weight 0.5 \
+              --pos-weight auto \
+              --split-by-time
+
+            echo "model_path=out/models/unet_pixelmask_latest.pt" >> "$GITHUB_OUTPUT"
+            echo "outtag=pixelmask" >> "$GITHUB_OUTPUT"
+            echo "use_disk=0" >> "$GITHUB_OUTPUT"
           fi
 
-          if [[ ! -f "$MODEL_PATH" ]]; then
-            echo "ERROR: expected model missing: $MODEL_PATH"
-            ls -la out/models || true
-            exit 1
-          fi
+          echo "---- list models ----"
+          ls -la out/models | head -n 200 || true
 
-          echo "model_path=$MODEL_PATH" >> "$GITHUB_OUTPUT"
-          echo "outtag=$OUTTAG" >> "$GITHUB_OUTPUT"
-          echo "use_disk=$USE_DISK" >> "$GITHUB_OUTPUT"
+      - name: Phase 3C - Debug checkpoint identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODEL_PATH="${{ steps.p3train.outputs.model_path }}"
+          test -f "$MODEL_PATH" || { echo "ERROR: missing model: $MODEL_PATH"; exit 1; }
 
-          echo "Resolved model_path=$MODEL_PATH"
-          echo "Resolved outtag=$OUTTAG"
-          echo "Resolved use_disk=$USE_DISK"
-
-          echo "---- checkpoint identity ----"
-          MODEL_PATH="$MODEL_PATH" python -c $'import os, torch\np=os.environ["MODEL_PATH"]\nckpt=torch.load(p, map_location="cpu")\nprint("ckpt type:", type(ckpt))\nif isinstance(ckpt, dict):\n    cfg=ckpt.get("config", {})\n    print("run_id:", cfg.get("run_id"))\n    print("use_disk_mask:", cfg.get("use_disk_mask"))\n    print("pos_weight:", cfg.get("pos_weight"))\n    print("bce_weight:", cfg.get("bce_weight"))\n'
+          python - <<'PY'
+          import torch, os
+          p = os.environ["MODEL_PATH"]
+          ckpt = torch.load(p, map_location="cpu")
+          print("MODEL_PATH:", p)
+          print("ckpt type:", type(ckpt))
+          if isinstance(ckpt, dict):
+              cfg = ckpt.get("config", {})
+              print("run_id:", cfg.get("run_id"))
+              print("use_disk_mask:", cfg.get("use_disk_mask"))
+              print("pos_weight:", cfg.get("pos_weight"))
+              print("bce_weight:", cfg.get("bce_weight"))
+          PY
+        env:
+          MODEL_PATH: ${{ steps.p3train.outputs.model_path }}
 
       # -------------------------
       # Phase 3D - Infer (multi-threshold) + debug pixel stats
-      #   - seg mode: uses ml/infer_unet_pixelmask.py (no disk mask)
-      #   - metrics mode: uses ml/infer_unet_masks.py (disk mask on)
+      #   - seg mode: use infer_unet_pixelmask.py (no disk mask)
+      #   - metrics mode: use infer_unet_masks.py (disk mask on)
       # -------------------------
       - name: Phase 3D - Infer masks (multi-threshold) + debug pixel stats
+        id: p3infer
         shell: bash
         run: |
           set -euo pipefail
@@ -341,9 +334,9 @@ jobs:
           DAY="${{ steps.resolve.outputs.day }}"
           RAWDIR="${{ steps.resolve.outputs.outframes }}"
           MODE="${{ steps.resolve.outputs.phase3_mode }}"
-          MODEL_PATH="${{ steps.p3model.outputs.model_path }}"
-          OUTTAG="${{ steps.p3model.outputs.outtag }}"
-          USE_DISK="${{ steps.p3model.outputs.use_disk }}"
+          MODEL_PATH="${{ steps.p3train.outputs.model_path }}"
+          OUTTAG="${{ steps.p3train.outputs.outtag }}"
+          USE_DISK="${{ steps.p3train.outputs.use_disk }}"
 
           echo "DAY=$DAY"
           echo "RAWDIR=$RAWDIR"
@@ -355,11 +348,6 @@ jobs:
           test -d "$RAWDIR" || { echo "ERROR: frames dir missing: $RAWDIR"; exit 1; }
           test -f "$MODEL_PATH" || { echo "ERROR: model missing: $MODEL_PATH"; exit 1; }
 
-          # Ensure seg-mode infer script exists when needed
-          if [[ "$USE_DISK" != "1" ]]; then
-            test -f "ml/infer_unet_pixelmask.py" || { echo "ERROR: missing ml/infer_unet_pixelmask.py (required for seg mode)"; ls -la ml || true; exit 1; }
-          fi
-
           THRS="0.3 0.5 0.6 0.7 0.8"
           CANON_OUT="out/$DAY/phase3_unet_${OUTTAG}_thr03"
 
@@ -368,20 +356,8 @@ jobs:
             echo "---- infer threshold=$T -> $OUTDIR ----"
             mkdir -p "$OUTDIR"
 
-            if [[ "$USE_DISK" == "1" ]]; then
-              # metrics-mode infer (existing script, expects UNet4-style ckpt)
-              python ml/infer_unet_masks.py \
-                --frames "$RAWDIR" \
-                --outdir "$OUTDIR" \
-                --ckpt "$MODEL_PATH" \
-                --recursive \
-                --threshold "$T" \
-                --image-size 256 \
-                --device cpu \
-                --use-disk-mask \
-                --disk-thresh 0.02
-            else
-              # seg-mode infer (new script, matches train_unet_pixelmask.py ckpt)
+            if [[ "$MODE" == "seg" ]]; then
+              # pixelmask inference entrypoint (new)
               python ml/infer_unet_pixelmask.py \
                 --frames "$RAWDIR" \
                 --outdir "$OUTDIR" \
@@ -390,6 +366,29 @@ jobs:
                 --threshold "$T" \
                 --image-size 256 \
                 --device cpu
+            else
+              # metrics inference entrypoint (existing)
+              if [[ "$USE_DISK" == "1" ]]; then
+                python ml/infer_unet_masks.py \
+                  --frames "$RAWDIR" \
+                  --outdir "$OUTDIR" \
+                  --ckpt "$MODEL_PATH" \
+                  --recursive \
+                  --threshold "$T" \
+                  --image-size 256 \
+                  --device cpu \
+                  --use-disk-mask \
+                  --disk-thresh 0.02
+              else
+                python ml/infer_unet_masks.py \
+                  --frames "$RAWDIR" \
+                  --outdir "$OUTDIR" \
+                  --ckpt "$MODEL_PATH" \
+                  --recursive \
+                  --threshold "$T" \
+                  --image-size 256 \
+                  --device cpu
+              fi
             fi
 
             OUTDIR="$OUTDIR" python -c $'from pathlib import Path\nimport os\nimport numpy as np\nfrom PIL import Image\n\noutdir = Path(os.environ["OUTDIR"]) / "masks_unet"\nfiles = sorted(outdir.glob("*.png"))\nprint("masks_unet:", outdir)\nprint("count:", len(files))\nif not files:\n    raise SystemExit("No mask PNGs found.")\n\nfor f in files[:5]:\n    a = np.array(Image.open(f).convert("L"))\n    white = (a >= 128).mean() * 100.0\n    print(f.name, "shape", a.shape, "min/max", int(a.min()), int(a.max()), "white%:", round(white, 4))\n'
@@ -401,20 +400,143 @@ jobs:
           # canonical = thr03
           test -d "$CANON_OUT/masks_unet" || { echo "ERROR: canonical output missing: $CANON_OUT/masks_unet"; exit 1; }
 
+          # hard fail if canonical masks are all black
           CANON_OUT="$CANON_OUT" python -c $'from pathlib import Path\nimport os\nimport numpy as np\nfrom PIL import Image\n\noutdir = Path(os.environ["CANON_OUT"]) / "masks_unet"\nmasks = sorted(outdir.glob("*.png"))[:10]\nprint("canonical check:", outdir)\nprint("checking", len(masks), "masks")\nif not masks:\n    raise SystemExit("No canonical mask PNGs found.")\n\nbad = 0\nfor p in masks:\n    a = np.array(Image.open(p).convert("L"))\n    if a.max() == 0:\n        bad += 1\n    print(p.name, "min/max", int(a.min()), int(a.max()), "white%:", float((a > 0).mean() * 100.0))\n\nif bad == len(masks):\n    raise SystemExit("All checked canonical masks are empty (all black). Failing.")\n'
 
+          echo "canon_out=$CANON_OUT" >> "$GITHUB_OUTPUT"
 
-      - name: Upload Phase 3 outputs (artifact)
+      # ============================================================
+      # Phase 4: ConvLSTM training ON GitHub Actions
+      #   - uses canonical Phase3 thr03 masks + raw frames
+      #   - builds a metrics CSV for train_convlstm.py
+      # ============================================================
+
+      - name: Phase 4A - Build ConvLSTM metrics CSV from Phase 3 canonical output
+        if: ${{ github.event.inputs.enable_phase4 != '0' }}
+        id: p4csv
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DAY="${{ steps.resolve.outputs.day }}"
+          RAWDIR="${{ steps.resolve.outputs.outframes }}"
+          CANON_OUT="${{ steps.p3infer.outputs.canon_out }}"
+
+          OUTROOT="out/$DAY/phase4_convlstm"
+          mkdir -p "$OUTROOT"
+
+          echo "DAY=$DAY"
+          echo "RAWDIR=$RAWDIR"
+          echo "CANON_OUT=$CANON_OUT"
+          echo "OUTROOT=$OUTROOT"
+
+          test -d "$RAWDIR" || { echo "ERROR: RAWDIR missing: $RAWDIR"; exit 1; }
+          test -d "$CANON_OUT/masks_unet" || { echo "ERROR: masks missing: $CANON_OUT/masks_unet"; exit 1; }
+
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import pandas as pd
+
+          day = Path("${{ steps.resolve.outputs.day }}")
+          rawdir = Path("${{ steps.resolve.outputs.outframes }}")
+          canon = Path("${{ steps.p3infer.outputs.canon_out }}") / "masks_unet"
+          outcsv = Path("out") / str(day) / "phase4_convlstm" / "convlstm_metrics.csv"
+
+          def ts_from_name(name: str):
+              # expects himawari_YYYYMMDDTHHMMSSZ.png
+              m = re.search(r"himawari_(\d{8}T\d{6})Z", name)
+              return m.group(1) + "Z" if m else None
+
+          frames = sorted(rawdir.glob("*.png"))
+          rows = []
+          for f in frames:
+              ts = ts_from_name(f.name)
+              if ts is None:
+                  continue
+              mask = canon / f"{f.stem}_mask.png"
+              if not mask.exists():
+                  # some pipelines may name mask exactly as frame + _mask
+                  # (this is the expected path here)
+                  continue
+
+              rows.append({
+                  "timestamp_utc": ts,
+                  # RELATIVE paths from repo root (train_convlstm.py expects relative)
+                  "image_path": str(f).replace("\\", "/"),
+                  "mask_path": str(mask).replace("\\", "/"),
+              })
+
+          df = pd.DataFrame(rows).sort_values("timestamp_utc").reset_index(drop=True)
+          outcsv.parent.mkdir(parents=True, exist_ok=True)
+          df.to_csv(outcsv, index=False)
+
+          print("Wrote:", outcsv)
+          print("rows:", len(df))
+          print(df.head(3).to_string(index=False))
+          if len(df) < 4:
+              raise SystemExit("Not enough (frame,mask) pairs to train ConvLSTM (need at least a few).")
+          PY
+
+          echo "metrics_csv=out/$DAY/phase4_convlstm/convlstm_metrics.csv" >> "$GITHUB_OUTPUT"
+
+      - name: Phase 4B - Train ConvLSTM (scheduled sampling)
+        if: ${{ github.event.inputs.enable_phase4 != '0' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          METRICS="${{ steps.p4csv.outputs.metrics_csv }}"
+          test -f "$METRICS" || { echo "ERROR: missing ConvLSTM metrics csv: $METRICS"; exit 1; }
+
+          USE_RGB="${{ github.event.inputs.convlstm_use_rgb }}"
+          SEQ_LEN="${{ github.event.inputs.convlstm_seq_len }}"
+          K="${{ github.event.inputs.convlstm_rollout_k }}"
+          EPOCHS="${{ github.event.inputs.convlstm_epochs }}"
+
+          echo "METRICS=$METRICS"
+          echo "USE_RGB=$USE_RGB"
+          echo "SEQ_LEN=$SEQ_LEN"
+          echo "K=$K"
+          echo "EPOCHS=$EPOCHS"
+
+          if [[ "$USE_RGB" == "1" ]]; then
+            python ml/train_convlstm.py \
+              --metrics-csv "$METRICS" \
+              --outdir out \
+              --seq-len "$SEQ_LEN" \
+              --rollout-k "$K" \
+              --epochs "$EPOCHS" \
+              --batch-size 2 \
+              --use-rgb
+          else
+            python ml/train_convlstm.py \
+              --metrics-csv "$METRICS" \
+              --outdir out \
+              --seq-len "$SEQ_LEN" \
+              --rollout-k "$K" \
+              --epochs "$EPOCHS" \
+              --batch-size 2
+          fi
+
+          echo "---- convlstm outputs ----"
+          ls -la out/models | grep convlstm || true
+          ls -la out/viz | grep convlstm || true
+
+      - name: Upload Phase 3/4 outputs (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: phase3_${{ steps.resolve.outputs.phase3_mode }}_${{ steps.resolve.outputs.day }}
+          name: rollup_${{ steps.resolve.outputs.day }}
           path: |
-            out/${{ steps.resolve.outputs.day }}/phase3_unet_${{ steps.p3model.outputs.outtag }}_thr03
+            out/${{ steps.resolve.outputs.day }}/daily
+            out/${{ steps.resolve.outputs.day }}/phase3_unet_${{ steps.p3train.outputs.outtag }}_thr03
+            out/${{ steps.resolve.outputs.day }}/phase4_convlstm
             out/cloud_metrics.csv
             out/masks
             out/models
+            out/viz
 
-      - name: Commit results to data
+      - name: Commit results to data (rebase-safe)
         shell: bash
         run: |
           set -euo pipefail
@@ -423,23 +545,22 @@ jobs:
           # Stage outputs
           git add -f data/raw out || true
 
-          # Commit if there are changes
+          # If nothing changed, bail early (but don't fail)
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          git commit -m "daily rollup + phase2 + phase3(mode=${{ steps.resolve.outputs.phase3_mode }}): $DAY"
+          git commit -m "daily rollup + phase2 + phase3(${{
+            steps.resolve.outputs.phase3_mode
+          }}) + phase4(convlstm optional): $DAY" || true
 
-          # ✅ KEY FIX: sync with remote data branch before push (handles concurrent runs)
+          # Make push robust against non-fast-forward
           git fetch origin data
+          git pull --rebase --autostash origin data
 
-          # Rebase our new commit(s) on top of the latest remote data
-          # (safe here because this branch is bot-generated artifacts)
-          git rebase origin/data
+          git push origin data
 
-          # Push our rebased HEAD back to data
-          git push origin HEAD:data
 
 
 
