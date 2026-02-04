@@ -138,6 +138,7 @@ Artifacts include:
 - Pixel-level U-Net segmentation significantly improves spatial stability
 - ConvLSTM models converge reliably but are computationally expensive on CPU
 - Temporal modeling benefits more from **clean segmentation** than from raw RGB alone
+<img width="906" height="508" alt="5e3d37abb53cdb1d08ee291db1a96237" src="https://github.com/user-attachments/assets/00821255-7604-418c-8362-c6c186f73011" />
 
 ---
 
@@ -167,6 +168,7 @@ Artifacts include:
 - Event-scale analysis (e.g., typhoons, frontal systems)
 
 ---
+
 
 ## Why This Matters
 
