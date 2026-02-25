@@ -339,16 +339,47 @@ def teacher_forcing_prob(epoch: int, warmup_epochs: int, decay_epochs: int, end_
 # Viz
 # -----------------------------
 def save_training_curves(hist: pd.DataFrame, out_png: Path) -> None:
-    plt.figure(figsize=(10, 6))
-    plt.plot(hist["epoch"], hist["train_loss"], label="train_loss")
-    plt.plot(hist["epoch"], hist["val_loss"], label="val_loss")
-    plt.title("ConvLSTM training curves")
-    plt.xlabel("epoch")
-    plt.ylabel("loss")
-    plt.legend()
-    plt.tight_layout()
+    """
+    3-panel figure: Loss, Dice, and IoU curves (train vs val per epoch).
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+    # Panel 1: Loss
+    ax = axes[0]
+    ax.plot(hist["epoch"], hist["train_loss"], marker="o", markersize=3, label="train")
+    ax.plot(hist["epoch"], hist["val_loss"], marker="s", markersize=3, label="val")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    ax.set_title("Loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2: Dice
+    ax = axes[1]
+    ax.plot(hist["epoch"], hist["train_dice"], marker="o", markersize=3, label="train")
+    ax.plot(hist["epoch"], hist["val_dice"], marker="s", markersize=3, label="val")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("dice")
+    ax.set_title("Dice")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 1)
+
+    # Panel 3: IoU
+    ax = axes[2]
+    ax.plot(hist["epoch"], hist["train_iou"], marker="o", markersize=3, label="train")
+    ax.plot(hist["epoch"], hist["val_iou"], marker="s", markersize=3, label="val")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("IoU")
+    ax.set_title("IoU")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 1)
+
+    fig.suptitle("ConvLSTM Training Curves", fontsize=12, fontweight="bold")
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_png, dpi=150)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200, bbox_inches="tight")
     plt.close()
 
 
