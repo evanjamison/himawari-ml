@@ -4,15 +4,12 @@ import argparse
 import json
 import math
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Tuple, Optional, List
 
-# ✅ Headless-safe backend for GitHub Actions
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -45,6 +42,10 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def as_posix_rel(p: Path) -> str:
+    return p.relative_to(REPO_ROOT).as_posix()
+
+
 _TS_RE = re.compile(r"himawari_(\d{8}T\d{6}Z)\.", re.IGNORECASE)
 
 
@@ -70,7 +71,6 @@ class CloudMaskDataset(Dataset):
       - mask_path (mask path relative to repo root)
       - img_ok (optional)
     """
-
     def __init__(
         self,
         metrics_csv: Path,
@@ -118,12 +118,7 @@ class CloudMaskDataset(Dataset):
         resample = Image.Resampling.NEAREST if is_mask else Image.Resampling.BILINEAR
         return im.resize((self.image_size, self.image_size), resample=resample)
 
-    def _augment_pair(
-        self,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        d: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def _augment_pair(self, x: torch.Tensor, y: torch.Tensor, d: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         # Safe augmentations: flips + 90° rotations
         if torch.rand(1).item() < 0.5:
             x = torch.flip(x, dims=[2])
@@ -261,6 +256,7 @@ def masked_bce_with_logits(
     # Select only masked pixels (flattened)
     m = mask.bool()
     if m.sum().item() == 0:
+        # fallback: no masked pixels (shouldn't happen), treat as unmasked
         return nn.functional.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
 
     l = logits[m]
@@ -363,13 +359,44 @@ def save_val_previews(model: nn.Module, dl: DataLoader, out_png: Path, device: t
 
 
 def save_training_curves(hist: pd.DataFrame, out_png: Path):
-    plt.figure()
-    plt.plot(hist["epoch"], hist["train_loss"], label="train_loss")
-    plt.plot(hist["epoch"], hist["val_loss"], label="val_loss")
-    plt.xlabel("epoch")
-    plt.ylabel("loss")
-    plt.title("U-Net training curves")
-    plt.legend()
+    """
+    3-panel figure: Loss, Dice, and IoU curves (train vs val per epoch).
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+    # Panel 1: Loss
+    ax = axes[0]
+    ax.plot(hist["epoch"], hist["train_loss"], marker="o", markersize=3, label="train")
+    ax.plot(hist["epoch"], hist["val_loss"], marker="s", markersize=3, label="val")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    ax.set_title("Loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2: Dice
+    ax = axes[1]
+    ax.plot(hist["epoch"], hist["train_dice"], marker="o", markersize=3, label="train")
+    ax.plot(hist["epoch"], hist["val_dice"], marker="s", markersize=3, label="val")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("dice")
+    ax.set_title("Dice")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 1)
+
+    # Panel 3: IoU
+    ax = axes[2]
+    ax.plot(hist["epoch"], hist["train_iou"], marker="o", markersize=3, label="train")
+    ax.plot(hist["epoch"], hist["val_iou"], marker="s", markersize=3, label="val")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("IoU")
+    ax.set_title("IoU")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 1)
+
+    fig.suptitle("U-Net Training Curves", fontsize=12, fontweight="bold")
     out_png.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(out_png, dpi=200, bbox_inches="tight")
@@ -550,6 +577,7 @@ def main() -> int:
     # pos_weight
     pos_weight_val: float
     if isinstance(args.pos_weight, str) and args.pos_weight.lower() == "auto":
+        # estimate on CPU from a small loader of the training set
         tmp_dl = DataLoader(train_ds, batch_size=max(1, min(args.batch_size, 8)), shuffle=False, num_workers=0)
         pos_weight_val = estimate_pos_weight_from_loader(tmp_dl, use_disk=args.use_disk_mask)
     else:
@@ -637,38 +665,20 @@ def main() -> int:
                 best_path,
             )
 
-    # ✅ FIX: use the correct variable name (pos_weight_val) and ensure this print never NameErrors
-    # ---- final summary (NO NameErrors) ----
-    print("[TRAIN] saved checkpoint:", str(best_path))
-    print("[TRAIN] run_id:", run_id)
-    print("[TRAIN] use_disk_mask:", bool(args.use_disk_mask), "disk_thresh:", float(args.disk_thresh))
-    print("[TRAIN] pos_weight:", float(pos_weight_val), "bce_weight:", float(args.bce_weight))
-
-
     hist = pd.DataFrame(history)
     hist.to_csv(metrics_path, index=False)
+    save_training_curves(hist, curves_png)
 
-    # ✅ Harden: plotting/previews should never fail the run
-    try:
-        save_training_curves(hist, curves_png)
-    except Exception as e:
-        print("[WARN] failed to save training curves:", repr(e))
-
-    try:
-        ckpt = torch.load(best_path, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        save_val_previews(model, val_dl, previews_png, device=device, n=8)
-    except Exception as e:
-        print("[WARN] failed to save val previews:", repr(e))
+    ckpt = torch.load(best_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    save_val_previews(model, val_dl, previews_png, device=device, n=8)
 
     print(f"Wrote: {metrics_path}")
-    print(f"Curves: {curves_png}")
-    print(f"Previews: {previews_png}")
+    print(f"Wrote: {curves_png}")
+    print(f"Wrote: {previews_png}")
     print("Done.")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
