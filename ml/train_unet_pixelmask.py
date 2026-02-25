@@ -57,38 +57,33 @@ def read_rgb(p: Path) -> np.ndarray:
 # Simple U-Net
 # ---------------------------
 
-class DoubleConv(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x):
-        return self.net(x)
+def conv_block(in_ch: int, out_ch: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+    )
 
 class UNet(nn.Module):
     def __init__(self, in_ch: int = 3, base_ch: int = 32):
         super().__init__()
-        self.enc1 = DoubleConv(in_ch, base_ch)
+        self.enc1 = conv_block(in_ch, base_ch)
         self.pool1 = nn.MaxPool2d(2)
-        self.enc2 = DoubleConv(base_ch, base_ch * 2)
+        self.enc2 = conv_block(base_ch, base_ch * 2)
         self.pool2 = nn.MaxPool2d(2)
-        self.enc3 = DoubleConv(base_ch * 2, base_ch * 4)
+        self.enc3 = conv_block(base_ch * 2, base_ch * 4)
         self.pool3 = nn.MaxPool2d(2)
-        self.enc4 = DoubleConv(base_ch * 4, base_ch * 8)
+        self.enc4 = conv_block(base_ch * 4, base_ch * 8)
 
         self.up3 = nn.ConvTranspose2d(base_ch * 8, base_ch * 4, 2, stride=2)
-        self.dec3 = DoubleConv(base_ch * 8, base_ch * 4)
+        self.dec3 = conv_block(base_ch * 8, base_ch * 4)
         self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 2, stride=2)
-        self.dec2 = DoubleConv(base_ch * 4, base_ch * 2)
+        self.dec2 = conv_block(base_ch * 4, base_ch * 2)
         self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, 2, stride=2)
-        self.dec1 = DoubleConv(base_ch * 2, base_ch)
+        self.dec1 = conv_block(base_ch * 2, base_ch)
 
         self.out = nn.Conv2d(base_ch, 1, kernel_size=1)
 
@@ -576,6 +571,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
