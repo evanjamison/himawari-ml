@@ -260,7 +260,10 @@ jobs:
             --raw-dir "$RAWDIR" \
             --outdir out \
             --image-size 256 \
-            --save-overlays
+            --save-overlays \
+            --luma-thresh 0.45 \
+            --sat-thresh 0.30 \
+            --min-area 60
 
           echo "---- verify teacher outputs ----"
           ls -la out/cloud_metrics.csv
