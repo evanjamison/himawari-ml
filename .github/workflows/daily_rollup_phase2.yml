@@ -33,6 +33,18 @@ on:
         description: "ConvLSTM epochs."
         required: false
         default: "20"
+      luma_thresh:
+        description: "Baseline luma threshold (brightness). Lower = more clouds detected."
+        required: false
+        default: "0.35"
+      sat_thresh:
+        description: "Baseline saturation threshold. Higher = more clouds detected."
+        required: false
+        default: "0.30"
+      min_area:
+        description: "Baseline minimum cloud component area in pixels."
+        required: false
+        default: "60"
 
 permissions:
   contents: write
@@ -56,6 +68,9 @@ jobs:
       CONVLSTM_SEQ_LEN: ${{ github.event.inputs.convlstm_seq_len || '6' }}
       CONVLSTM_ROLLOUT_K: ${{ github.event.inputs.convlstm_rollout_k || '2' }}
       CONVLSTM_EPOCHS: ${{ github.event.inputs.convlstm_epochs || '20' }}
+      LUMA_THRESH: ${{ github.event.inputs.luma_thresh || '0.50' }}
+      SAT_THRESH: ${{ github.event.inputs.sat_thresh || '0.30' }}
+      MIN_AREA: ${{ github.event.inputs.min_area || '60' }}
 
     steps:
       - name: Checkout data branch
@@ -251,23 +266,38 @@ jobs:
       # ============================================================
 
       - name: Phase 3A - Build teacher masks + cloud_metrics.csv (baseline v2)
+        id: p3baseline
         shell: bash
         run: |
           set -euo pipefail
           RAWDIR="${{ steps.resolve.outputs.outframes }}"
+          DAY="${{ steps.resolve.outputs.day }}"
+
+          # Day-specific output so masks are never overwritten by future runs
+          BASELINE_OUTDIR="out/$DAY/phase2_baseline"
+          mkdir -p "$BASELINE_OUTDIR"
+
+          echo "LUMA_THRESH=${LUMA_THRESH}"
+          echo "SAT_THRESH=${SAT_THRESH}"
+          echo "MIN_AREA=${MIN_AREA}"
 
           python scripts/experiments/segmentation/cloud_mask_baseline_v2.py \
             --raw-dir "$RAWDIR" \
-            --outdir out \
+            --outdir "$BASELINE_OUTDIR" \
             --image-size 256 \
             --save-overlays \
-            --luma-thresh 0.45 \
-            --sat-thresh 0.30 \
-            --min-area 60
+            --luma-thresh "${LUMA_THRESH}" \
+            --sat-thresh  "${SAT_THRESH}" \
+            --min-area    "${MIN_AREA}"
 
           echo "---- verify teacher outputs ----"
-          ls -la out/cloud_metrics.csv
-          ls -la out/masks | head -n 20 || true
+          ls -la "$BASELINE_OUTDIR/cloud_metrics.csv"
+          ls -la "$BASELINE_OUTDIR/masks" | head -n 20 || true
+
+          echo "baseline_outdir=$BASELINE_OUTDIR" >> "$GITHUB_OUTPUT"
+          echo "masks_dir=$BASELINE_OUTDIR/masks" >> "$GITHUB_OUTPUT"
+          echo "overlays_dir=$BASELINE_OUTDIR/overlays" >> "$GITHUB_OUTPUT"
+          echo "metrics_csv=$BASELINE_OUTDIR/cloud_metrics.csv" >> "$GITHUB_OUTPUT"
 
       - name: Phase 3B - Train model (metrics OR seg)
         id: p3train
@@ -275,17 +305,13 @@ jobs:
         run: |
           set -euo pipefail
           MODE="${{ steps.resolve.outputs.phase3_mode }}"
-          DAY="${{ steps.resolve.outputs.day }}"
-          # Day-specific output root: all viz, models, and curves land here
-          DAY_OUTDIR="out/$DAY/phase3_train"
-          mkdir -p "$DAY_OUTDIR"
-          echo "Phase3 MODE=$MODE  DAY_OUTDIR=$DAY_OUTDIR"
+          echo "Phase3 MODE=$MODE"
 
           if [[ "$MODE" == "metrics" ]]; then
             # teacher-metrics training (disk mask ON)
             python ml/train_unet.py \
-              --metrics-csv out/cloud_metrics.csv \
-              --outdir "$DAY_OUTDIR" \
+              --metrics-csv "${{ steps.p3baseline.outputs.metrics_csv }}" \
+              --outdir out \
               --epochs 30 \
               --batch-size 4 \
               --lr 3e-4 \
@@ -296,7 +322,7 @@ jobs:
               --pos-weight auto \
               --split-by-time
 
-            echo "model_path=$DAY_OUTDIR/models/unet_cloudmask_latest.pt" >> "$GITHUB_OUTPUT"
+            echo "model_path=out/models/unet_cloudmask_latest.pt" >> "$GITHUB_OUTPUT"
             echo "outtag=cloudmask" >> "$GITHUB_OUTPUT"
             echo "use_disk=1" >> "$GITHUB_OUTPUT"
 
@@ -307,8 +333,8 @@ jobs:
             #  - it does NOT support --pos-weight auto (must be float)
             python ml/train_unet_pixelmask.py \
               --frames-dir "${{ steps.resolve.outputs.outframes }}" \
-              --masks-dir  out/masks \
-              --outdir "$DAY_OUTDIR" \
+              --masks-dir  "${{ steps.p3baseline.outputs.masks_dir }}" \
+              --outdir out \
               --image-size 256 \
               --epochs 30 \
               --batch-size 4 \
@@ -319,15 +345,13 @@ jobs:
               --pos-weight 3.0 \
               --split-by-time
 
-            echo "model_path=$DAY_OUTDIR/models/unet_pixelmask_latest.pt" >> "$GITHUB_OUTPUT"
+            echo "model_path=out/models/unet_pixelmask_latest.pt" >> "$GITHUB_OUTPUT"
             echo "outtag=pixelmask" >> "$GITHUB_OUTPUT"
             echo "use_disk=0" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "day_outdir=$DAY_OUTDIR" >> "$GITHUB_OUTPUT"
-
           echo "---- list models ----"
-          ls -la "$DAY_OUTDIR/models" | head -n 200 || true
+          ls -la out/models | head -n 200 || true
 
       - name: Phase 3C - Debug checkpoint identity
         shell: bash
@@ -528,15 +552,11 @@ jobs:
           print("tail:", df.tail(2).to_dict(orient="records"))
           PY
 
-          DAY="${{ steps.resolve.outputs.day }}"
-          DAY_OUTDIR="out/$DAY/phase4_convlstm"
-          mkdir -p "$DAY_OUTDIR"
-
           echo "---- SMOKE RUN (epochs=1, rollout_k=1) ----"
           if [[ "$USE_RGB" == "1" ]]; then
             python -u ml/train_convlstm.py \
               --metrics-csv "$METRICS" \
-              --outdir "$DAY_OUTDIR" \
+              --outdir out \
               --seq-len "$SEQ_LEN" \
               --rollout-k 1 \
               --epochs 1 \
@@ -545,7 +565,7 @@ jobs:
           else
             python -u ml/train_convlstm.py \
               --metrics-csv "$METRICS" \
-              --outdir "$DAY_OUTDIR" \
+              --outdir out \
               --seq-len "$SEQ_LEN" \
               --rollout-k 1 \
               --epochs 1 \
@@ -556,7 +576,7 @@ jobs:
           if [[ "$USE_RGB" == "1" ]]; then
             python -u ml/train_convlstm.py \
               --metrics-csv "$METRICS" \
-              --outdir "$DAY_OUTDIR" \
+              --outdir out \
               --seq-len "$SEQ_LEN" \
               --rollout-k "$K" \
               --epochs "$EPOCHS" \
@@ -565,7 +585,7 @@ jobs:
           else
             python -u ml/train_convlstm.py \
               --metrics-csv "$METRICS" \
-              --outdir "$DAY_OUTDIR" \
+              --outdir out \
               --seq-len "$SEQ_LEN" \
               --rollout-k "$K" \
               --epochs "$EPOCHS" \
@@ -573,8 +593,8 @@ jobs:
           fi
 
           echo "---- convlstm outputs ----"
-          ls -la "$DAY_OUTDIR/models" | grep -i convlstm || true
-          ls -la "$DAY_OUTDIR/viz"    | grep -i convlstm || true
+          ls -la out/models | grep -i convlstm || true
+          ls -la out/viz    | grep -i convlstm || true
 
       - name: Phase 4C - Evaluate ConvLSTM rollouts (closed-loop)
         if: ${{ env.ENABLE_PHASE4 != '0' && steps.p4csv.outputs.metrics_csv != '' }}
@@ -587,7 +607,7 @@ jobs:
 
           test -f "$METRICS" || { echo "ERROR: missing metrics csv: $METRICS"; exit 1; }
 
-          CKPT="out/$DAY/phase4_convlstm/models/convlstm_ss_best_gray.pt"
+          CKPT="out/models/convlstm_ss_best_gray.pt"
           test -f "$CKPT" || { echo "ERROR: missing ConvLSTM ckpt: $CKPT"; ls -la out/models | grep convlstm || true; exit 1; }
 
           OUTDIR="out/$DAY/phase4_convlstm/rollout_eval"
@@ -622,6 +642,9 @@ jobs:
           if-no-files-found: ignore
           path: |
             out/${{ steps.resolve.outputs.day }}/daily
+            out/${{ steps.resolve.outputs.day }}/phase2_baseline/masks
+            out/${{ steps.resolve.outputs.day }}/phase2_baseline/overlays
+            out/${{ steps.resolve.outputs.day }}/phase2_baseline/cloud_metrics.csv
             out/${{ steps.resolve.outputs.day }}/phase3_train/viz
             out/${{ steps.resolve.outputs.day }}/phase3_train/models
             out/${{ steps.resolve.outputs.day }}/phase3_unet_${{ steps.p3train.outputs.outtag }}_thr03
@@ -629,8 +652,6 @@ jobs:
             out/${{ steps.resolve.outputs.day }}/phase4_convlstm/rollout_eval/rollout_metrics.csv
             out/${{ steps.resolve.outputs.day }}/phase4_convlstm/rollout_eval/rollout_summary.csv
             out/${{ steps.resolve.outputs.day }}/phase4_convlstm/rollout_eval/rollout_contact_sheet.png
-            out/cloud_metrics.csv
-            out/masks
 
       - name: Commit results to data (rebase-safe)
         shell: bash
