@@ -1,6 +1,6 @@
 {
   "frames_dir": "data/raw/2026-02-24/master/frames",
-  "masks_dir": "out/masks",
+  "masks_dir": "out/2026-02-24/phase2_baseline/masks",
   "outdir": "out",
   "image_size": 256,
   "mask_threshold": 128,
