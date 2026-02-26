@@ -44,6 +44,21 @@ def earth_disk_mask(h: int, w: int, margin: int = 4) -> np.ndarray:
     return (dist <= r).astype(np.uint8)
 
 
+def limb_distance_map(h: int, w: int, margin: int = 4) -> np.ndarray:
+    """
+    Returns a float map [0.0, 1.0] per pixel representing normalised distance
+    from the disk centre.  0.0 = centre, 1.0 = disk edge.
+    Pixels outside the disk are > 1.0.
+    Used to apply a more lenient cloud threshold near the limb where oblique
+    viewing geometry darkens cloud tops.
+    """
+    yy, xx = np.mgrid[:h, :w]
+    cy, cx = h // 2, w // 2
+    r = min(cx, cy) - margin
+    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    return dist / r
+
+
 def remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
     num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     out = np.zeros_like(mask)
@@ -64,17 +79,33 @@ def cloud_mask_baseline(
     open_size: int,
     close_size: int,
     min_area: int,
+    limb_zone: float = 0.85,
+    limb_luma_offset: float = 0.10,
+    limb_sat_offset: float = 0.05,
 ) -> np.ndarray:
     """
     Generate cloud mask from RGB image.
+
+    Limb-aware detection:
+      Pixels beyond `limb_zone` fraction of the disk radius use a more lenient
+      threshold (luma reduced by limb_luma_offset, sat increased by limb_sat_offset)
+      to compensate for oblique viewing geometry darkening cloud tops at the disk edge.
     """
 
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     v = hsv[..., 2].astype(np.float32) / 255.0
     s = hsv[..., 1].astype(np.float32) / 255.0
 
-    # Bright & low-sat → clouds
-    cloud_raw = (v >= luma_thresh) & (s <= sat_thresh)
+    h, w = rgb.shape[:2]
+    dist_norm = limb_distance_map(h, w)
+
+    # Standard detection for disk centre
+    is_limb = dist_norm > limb_zone
+    luma_t = np.where(is_limb, luma_thresh - limb_luma_offset, luma_thresh)
+    sat_t  = np.where(is_limb, sat_thresh  + limb_sat_offset,  sat_thresh)
+
+    # Bright & low-sat → clouds (limb-aware thresholds applied per-pixel)
+    cloud_raw = (v >= luma_t) & (s <= sat_t)
     cloud = cloud_raw.astype(np.uint8)
 
     # Morphological cleanup
@@ -120,6 +151,12 @@ def main():
     ap.add_argument("--overlay-alpha", type=float, default=0.45)
     ap.add_argument("--save-overlays", action="store_true")
     ap.add_argument("--max-frames", type=int, default=None)
+    ap.add_argument("--limb-zone", type=float, default=0.85,
+                    help="Normalised disk radius beyond which limb thresholds apply (0-1). Default 0.85.")
+    ap.add_argument("--limb-luma-offset", type=float, default=0.10,
+                    help="How much to reduce luma threshold in the limb zone. Default 0.10.")
+    ap.add_argument("--limb-sat-offset", type=float, default=0.05,
+                    help="How much to increase sat threshold in the limb zone. Default 0.05.")
     args = ap.parse_args()
 
     raw_dir = Path(args.raw_dir)
@@ -149,6 +186,9 @@ def main():
             open_size=args.open_size,
             close_size=args.close_size,
             min_area=args.min_area,
+            limb_zone=args.limb_zone,
+            limb_luma_offset=args.limb_luma_offset,
+            limb_sat_offset=args.limb_sat_offset,
         )
 
         cloud = cloud * disk
