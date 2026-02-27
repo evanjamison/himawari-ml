@@ -113,74 +113,57 @@ def _parse_hsd_segment(data: bytes) -> np.ndarray | None:
     """
     Parse a decompressed HSD segment and return float32 reflectance [0,1].
 
-    HSD block layout — each block starts with:
-      1 byte  : block number
-      2 bytes : block length (uint16, includes these 3 header bytes)
+    Block sizes from Himawari Standard Data User's Guide v1.3 (JMA):
+      Block 1  : 282 bytes — basic info; byte 4 (0-indexed) = byte order
+      Block 2  :  50 bytes — data info; ncols at +5 (int16 LE), nlines at +7
+      Block 3  : 127 bytes — projection info
+      Block 4  : 139 bytes — navigation info
+      Block 5  : 147 bytes — calibration; slope at +3 (float64 LE), intercept at +11
+      Block 6  : 259 bytes — inter-calibration
+      Block 7  :  47 bytes — segment info
+      Block 8  :  35 bytes — navigation correction
+      Block 9  :  13 bytes — observation time
+      Block 10 :  13 bytes — error info
+      Block 11 :  13 bytes — spare
+      Data             — 16-bit unsigned pixel counts (little-endian)
 
-    Known blocks and their total sizes (bytes):
-      Block 1  : 282  — basic info (lines, columns)
-      Block 2  : 50   — data info
-      Block 3  : 50   — projection
-      Block 4  : 127  — navigation
-      Block 5  : 115  — calibration (slope at +3, intercept at +11)
-      Block 6  : 17   — inter-calibration
-      Block 7  : 59   — segment info
-      Block 8  : 33   — navigation correction
-      Block 9  : 13   — observation time
-      Block 10 : 13   — error info
-      Block 11 : 13   — spare
-      Data block follows immediately after block 11
+    Total header = 282+50+127+139+147+259+47+35+13+13+13 = 1125 bytes
     """
+    # Fixed block sizes per spec
+    BLOCK_SIZES = [282, 50, 127, 139, 147, 259, 47, 35, 13, 13, 13]
+    TOTAL_HEADER = sum(BLOCK_SIZES)  # 1125
+
     try:
-        # Walk blocks dynamically using the block-length field
-        # to find the true data start — more robust than hardcoded offsets
-        offset = 0
-        block_data: dict[int, bytes] = {}
-
-        for _ in range(11):
-            if offset + 3 > len(data):
-                break
-            block_num = struct.unpack_from("B", data, offset)[0]
-            block_len = struct.unpack_from(">H", data, offset + 1)[0]
-            if block_len == 0:
-                break
-            block_data[block_num] = data[offset: offset + block_len]
-            offset += block_len
-
-        # Data starts immediately after block 11
-        data_offset = offset
-
-        # Parse block 1 for dimensions
-        b1 = block_data.get(1, b"")
-        if len(b1) < 50:
-            log.warning("HSD: block 1 too short")
+        if len(data) < TOTAL_HEADER:
+            log.warning(f"HSD: file too short ({len(data)} < {TOTAL_HEADER})")
             return None
 
-        endian = ">" if struct.unpack_from("B", b1, 5)[0] == 0 else "<"
-        nlines = struct.unpack_from(f"{endian}H", b1, 6)[0]
-        ncols  = struct.unpack_from(f"{endian}H", b1, 8)[0]
+        # Block 2 starts at offset 282
+        # Layout: 1B block_num, 2B block_len, 2B spare, 2B ncols (int16), 2B nlines (int16)
+        b2_start = 282
+        ncols  = struct.unpack_from("<h", data, b2_start + 5)[0]
+        nlines = struct.unpack_from("<h", data, b2_start + 7)[0]
 
-        # Parse block 5 for calibration
-        b5 = block_data.get(5, b"")
-        if len(b5) >= 27:
-            slope     = struct.unpack_from(f"{endian}d", b5, 3)[0]
-            intercept = struct.unpack_from(f"{endian}d", b5, 11)[0]
-        else:
-            # Fallback: use linear scaling without calibration
-            slope, intercept = 1.0 / 65535.0, 0.0
+        # Block 5 starts at offset 282+50+127+139 = 598
+        b5_start = 282 + 50 + 127 + 139
+        slope     = struct.unpack_from("<d", data, b5_start + 3)[0]
+        intercept = struct.unpack_from("<d", data, b5_start + 11)[0]
 
-        # Align data offset to 2-byte boundary
-        remaining = len(data) - data_offset
-        if remaining % 2 != 0:
+        # Data starts immediately after all 11 header blocks
+        data_offset = TOTAL_HEADER
+
+        # Align to 2-byte boundary just in case
+        if (len(data) - data_offset) % 2 != 0:
             data_offset += 1
 
-        raw = np.frombuffer(data[data_offset:], dtype=np.dtype(f"{endian}u2"))
+        raw = np.frombuffer(data[data_offset:], dtype=np.dtype("<u2"))
 
-        if raw.size < nlines * ncols:
-            log.warning(f"HSD: expected {nlines*ncols} pixels, got {raw.size} (offset={data_offset})")
+        expected = nlines * ncols
+        if raw.size < expected:
+            log.warning(f"HSD: expected {expected} pixels ({nlines}x{ncols}), got {raw.size} (offset={data_offset})")
             return None
 
-        raw = raw[:nlines * ncols].reshape(nlines, ncols).astype(np.float32)
+        raw = raw[:expected].reshape(nlines, ncols).astype(np.float32)
 
         invalid     = (raw == 0) | (raw == 65535)
         reflectance = np.clip(raw * slope + intercept, 0.0, 1.0)
