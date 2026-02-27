@@ -257,7 +257,7 @@ def fetch_frame(
 def latest_timestamp_10min() -> datetime:
     now    = datetime.now(timezone.utc)
     minute = (now.minute // 10) * 10
-    return now.replace(minute=minute, second=0, microsecond=0) - timedelta(hours=1)
+    return now.replace(minute=minute, second=0, microsecond=0)
 
 
 def main(
@@ -283,6 +283,31 @@ def main(
         log.error(str(e))
         log.info(f"Done. Saved 0 frames. out={out} target_saved={TARGET_SAVED}")
         return 0
+
+    # -----------------------------------------------------------------------
+    # Directory probe — list what's actually on the server to verify
+    # path format and see which timestamps are available.
+    # -----------------------------------------------------------------------
+    try:
+        today     = datetime.now(timezone.utc)
+        ym        = today.strftime("%Y%m")
+        d         = today.strftime("%d")
+        base_path = f"/jma/hsd/{ym}/{d}"
+        log.info(f"---- FTP directory probe: {base_path} ----")
+        ftp.cwd(base_path)
+        time_dirs = sorted(ftp.nlst())
+        log.info(f"Available time dirs ({len(time_dirs)} total): {time_dirs[:10]}")
+        if time_dirs:
+            latest_dir = time_dirs[-1]
+            ftp.cwd(latest_dir)
+            files = sorted(ftp.nlst())
+            log.info(f"Files in {base_path}/{latest_dir} ({len(files)} total):")
+            for f in files[:10]:
+                log.info(f"  {f}")
+            ftp.cwd("/")
+    except Exception as e:
+        log.warning(f"Directory probe failed: {e}")
+    # -----------------------------------------------------------------------
 
     saved = checked = 0
 
