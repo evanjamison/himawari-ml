@@ -113,34 +113,71 @@ def _parse_hsd_segment(data: bytes) -> np.ndarray | None:
     """
     Parse a decompressed HSD segment and return float32 reflectance [0,1].
 
-    HSD block layout (big-endian by default):
-      Block 1  (282 bytes) — basic info: lines, columns, bits per pixel
-      Block 2  (  4 bytes) — data info
-      Block 3  ( 50 bytes) — projection
-      Block 4  (127 bytes) — navigation
-      Block 5  (115 bytes) — calibration: slope + intercept at offsets 3 and 11
-      Blocks 6-11          — other metadata
-      Data                 — 16-bit unsigned pixel counts
+    HSD block layout — each block starts with:
+      1 byte  : block number
+      2 bytes : block length (uint16, includes these 3 header bytes)
+
+    Known blocks and their total sizes (bytes):
+      Block 1  : 282  — basic info (lines, columns)
+      Block 2  : 50   — data info
+      Block 3  : 50   — projection
+      Block 4  : 127  — navigation
+      Block 5  : 115  — calibration (slope at +3, intercept at +11)
+      Block 6  : 17   — inter-calibration
+      Block 7  : 59   — segment info
+      Block 8  : 33   — navigation correction
+      Block 9  : 13   — observation time
+      Block 10 : 13   — error info
+      Block 11 : 13   — spare
+      Data block follows immediately after block 11
     """
     try:
-        block1 = data[0:282]
-        endian = ">" if struct.unpack_from("B", block1, 5)[0] == 0 else "<"
+        # Walk blocks dynamically using the block-length field
+        # to find the true data start — more robust than hardcoded offsets
+        offset = 0
+        block_data: dict[int, bytes] = {}
 
-        nlines = struct.unpack_from(f"{endian}H", block1, 164)[0]
-        ncols  = struct.unpack_from(f"{endian}H", block1, 166)[0]
+        for _ in range(11):
+            if offset + 3 > len(data):
+                break
+            block_num = struct.unpack_from("B", data, offset)[0]
+            block_len = struct.unpack_from(">H", data, offset + 1)[0]
+            if block_len == 0:
+                break
+            block_data[block_num] = data[offset: offset + block_len]
+            offset += block_len
 
-        # Calibration block starts at byte 463 (282+4+50+127)
-        calib_offset = 282 + 4 + 50 + 127
-        slope     = struct.unpack_from(f"{endian}d", data, calib_offset + 3)[0]
-        intercept = struct.unpack_from(f"{endian}d", data, calib_offset + 11)[0]
+        # Data starts immediately after block 11
+        data_offset = offset
 
-        # Total header size stored in block 1 at offset 274 (uint32)
-        total_header = struct.unpack_from(f"{endian}I", block1, 274)[0]
+        # Parse block 1 for dimensions
+        b1 = block_data.get(1, b"")
+        if len(b1) < 50:
+            log.warning("HSD: block 1 too short")
+            return None
 
-        raw = np.frombuffer(data[total_header:], dtype=np.dtype(f"{endian}u2"))
+        endian = ">" if struct.unpack_from("B", b1, 5)[0] == 0 else "<"
+        nlines = struct.unpack_from(f"{endian}H", b1, 6)[0]
+        ncols  = struct.unpack_from(f"{endian}H", b1, 8)[0]
+
+        # Parse block 5 for calibration
+        b5 = block_data.get(5, b"")
+        if len(b5) >= 27:
+            slope     = struct.unpack_from(f"{endian}d", b5, 3)[0]
+            intercept = struct.unpack_from(f"{endian}d", b5, 11)[0]
+        else:
+            # Fallback: use linear scaling without calibration
+            slope, intercept = 1.0 / 65535.0, 0.0
+
+        # Align data offset to 2-byte boundary
+        remaining = len(data) - data_offset
+        if remaining % 2 != 0:
+            data_offset += 1
+
+        raw = np.frombuffer(data[data_offset:], dtype=np.dtype(f"{endian}u2"))
 
         if raw.size < nlines * ncols:
-            log.warning(f"HSD: expected {nlines*ncols} pixels, got {raw.size}")
+            log.warning(f"HSD: expected {nlines*ncols} pixels, got {raw.size} (offset={data_offset})")
             return None
 
         raw = raw[:nlines * ncols].reshape(nlines, ncols).astype(np.float32)
