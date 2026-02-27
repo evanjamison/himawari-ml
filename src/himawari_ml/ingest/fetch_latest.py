@@ -111,68 +111,70 @@ def _ftp_read(ftp: ftplib.FTP, remote_path: str, cfg: FetchCfg) -> bytes | None:
 
 def _parse_hsd_segment(data: bytes) -> np.ndarray | None:
     """
-    Parse a decompressed HSD segment and return float32 reflectance [0,1].
+    Parse a decompressed HSD segment and return float32 normalized counts [0,1].
 
-    Block sizes from Himawari Standard Data User's Guide v1.3 (JMA):
-      Block 1  : 282 bytes — basic info; byte 4 (0-indexed) = byte order
-      Block 2  :  50 bytes — data info; ncols at +5 (int16 LE), nlines at +7
-      Block 3  : 127 bytes — projection info
-      Block 4  : 139 bytes — navigation info
-      Block 5  : 147 bytes — calibration; slope at +3 (float64 LE), intercept at +11
-      Block 6  : 259 bytes — inter-calibration
-      Block 7  :  47 bytes — segment info
-      Block 8  :  35 bytes — navigation correction
-      Block 9  :  13 bytes — observation time
-      Block 10 :  13 bytes — error info
-      Block 11 :  13 bytes — spare
-      Data             — 16-bit unsigned pixel counts (little-endian)
-
-    Total header = 282+50+127+139+147+259+47+35+13+13+13 = 1125 bytes
+    Block sizes (Himawari Standard Data User's Guide v1.3, JMA):
+      Block 1  : 282 bytes
+      Block 2  :  50 bytes  — number_of_columns at +3 (uint32 LE), number_of_lines at +7
+      Block 3  : 127 bytes
+      Block 4  : 139 bytes
+      Block 5  : 147 bytes
+      Block 6  : 259 bytes
+      Block 7  :  47 bytes
+      Block 8  :  35 bytes
+      Block 9  :  13 bytes
+      Block 10 :  13 bytes
+      Block 11 :  13 bytes
+      Data     : 16-bit unsigned pixel counts, little-endian
+    Total header = 1125 bytes
     """
-    # Fixed block sizes per spec
-    BLOCK_SIZES = [282, 50, 127, 139, 147, 259, 47, 35, 13, 13, 13]
-    TOTAL_HEADER = sum(BLOCK_SIZES)  # 1125
+    BLOCK_SIZES   = [282, 50, 127, 139, 147, 259, 47, 35, 13, 13, 13]
+    TOTAL_HEADER  = sum(BLOCK_SIZES)   # 1125
 
     try:
-        if len(data) < TOTAL_HEADER:
-            log.warning(f"HSD: file too short ({len(data)} < {TOTAL_HEADER})")
+        if len(data) < TOTAL_HEADER + 2:
+            log.warning(f"HSD: file too short ({len(data)})")
             return None
 
-        # Block 2 starts at offset 282
-        # Layout: 1B block_num, 2B block_len, 2B spare, 2B ncols (int16), 2B nlines (int16)
-        b2_start = 282
-        ncols  = struct.unpack_from("<h", data, b2_start + 5)[0]
-        nlines = struct.unpack_from("<h", data, b2_start + 7)[0]
+        # Block 2 starts at byte 282.
+        # Per spec Table 6 block 2:
+        #   +0  : block number    (uint8)
+        #   +1  : block length    (uint16 LE)
+        #   +3  : number_of_columns (uint32 LE)
+        #   +7  : number_of_lines   (uint32 LE)
+        b2 = 282
+        ncols  = struct.unpack_from("<I", data, b2 + 3)[0]
+        nlines = struct.unpack_from("<I", data, b2 + 7)[0]
 
-        # Block 5 calibration offsets in the actual files don't match the spec
-        # reliably. For visible bands (B01/B02/B03) used for RGB cloud imagery,
-        # direct count normalization to [0,1] produces equivalent results and
-        # avoids the calibration parsing issue entirely.
-        # raw counts are uint16: 0=fill, 1-65534=valid, 65535=saturated
+        if ncols == 0 or nlines == 0:
+            log.warning(f"HSD: zero dimensions ncols={ncols} nlines={nlines}")
+            return None
 
-        # Data starts immediately after all 11 header blocks
+        # Pixel data immediately follows the 11 header blocks
         data_offset = TOTAL_HEADER
 
-        # Align to 2-byte boundary just in case
+        # Align to 2-byte boundary
         if (len(data) - data_offset) % 2 != 0:
             data_offset += 1
 
-        raw = np.frombuffer(data[data_offset:], dtype=np.dtype("<u2"))
+        raw = np.frombuffer(data[data_offset:], dtype=np.dtype("<u2")).copy()
 
-        expected = nlines * ncols
+        expected = int(nlines) * int(ncols)
         if raw.size < expected:
-            log.warning(f"HSD: expected {expected} pixels ({nlines}x{ncols}), got {raw.size} (offset={data_offset})")
+            log.warning(
+                f"HSD: expected {expected} pixels ({nlines}x{ncols}), "
+                f"got {raw.size} (offset={data_offset}, filesize={len(data)})"
+            )
             return None
 
-        raw = raw[:expected].reshape(nlines, ncols).astype(np.float32)
-        log.info(f"HSD raw pixel stats: min={raw.min():.0f} max={raw.max():.0f} mean={raw.mean():.0f}")
+        raw = raw[:expected].reshape(int(nlines), int(ncols)).astype(np.float32)
 
-        invalid     = (raw == 0) | (raw == 65535)
-        # Normalize valid counts to [0, 1]
-        reflectance = raw / 65534.0
-        reflectance[invalid] = 0.0
+        # 0 = fill/space, 65535 = saturated — both treated as invalid
+        invalid = (raw == 0) | (raw == 65535)
+        normalized = raw / 65534.0
+        normalized[invalid] = 0.0
 
-        return reflectance
+        return normalized
 
     except Exception as e:
         log.warning(f"HSD parse error: {e}")
@@ -264,6 +266,36 @@ def fetch_frame(
     r = _resize_band(band_arrays["B03"])
     g = _resize_band(band_arrays["B02"])
     b = _resize_band(band_arrays["B01"])
+
+    # Debug: log band stats to diagnose black image issues
+    log.info(
+        f"Band stats before gamma: "
+        f"R mean={r.mean():.4f} max={r.max():.4f} | "
+        f"G mean={g.mean():.4f} | "
+        f"B mean={b.mean():.4f}"
+    )
+
+    # HSD segments are stored north-to-south so no vertical flip needed.
+    # Gamma correction: convert linear counts to display-ready values.
+    # Standard sRGB gamma = 0.45 (inverse of display gamma 2.2)
+    GAMMA = 0.45
+    r = np.power(np.clip(r, 1e-6, 1.0), GAMMA)
+    g = np.power(np.clip(g, 1e-6, 1.0), GAMMA)
+    b = np.power(np.clip(b, 1e-6, 1.0), GAMMA)
+
+    # Re-apply space mask AFTER gamma (gamma of near-zero values is still bright)
+    # Space pixels (original value=0) were set to 0.0 in parser, stay 0 after gamma
+    # of 1e-6 → (1e-6)^0.45 ≈ 0.001 — dark enough, but let's force them to black
+    r[band_arrays["B03"] == 0] = 0.0
+    g[band_arrays["B02"] == 0] = 0.0
+    b[band_arrays["B01"] == 0] = 0.0
+
+    log.info(
+        f"Band stats after gamma: "
+        f"R mean={r.mean():.4f} max={r.max():.4f} | "
+        f"G mean={g.mean():.4f} | "
+        f"B mean={b.mean():.4f}"
+    )
 
     rgb = np.clip(np.stack([r, g, b], axis=-1) * 255, 0, 255).astype(np.uint8)
 
