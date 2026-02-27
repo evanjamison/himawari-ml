@@ -159,15 +159,20 @@ def _parse_hsd_segment(data: bytes) -> np.ndarray | None:
 def _remote_path(ts: datetime, band: str, res: str, seg: int) -> str:
     """
     Build JAXA P-Tree FTP path.
-    /jma/hsd/YYYYMM/DD/HHmm/HS_H08_YYYYMMDD_HHmm_Bxx_FLDK_Rxx_Sxxx0.DAT.bz2
+    /jma/hsd/YYYYMM/DD/HH/HS_H09_YYYYMMDD_HHmm_Bxx_FLDK_Rxx_Sxxx0.DAT.bz2
+
+    Notes:
+    - Directory uses HH (hour only), filename uses HHmm (hour + minute)
+    - Himawari-9 (H09) replaced Himawari-8 (H08) in December 2022
     """
     ym   = ts.strftime("%Y%m")
     d    = ts.strftime("%d")
     ymd  = ts.strftime("%Y%m%d")
     hhmm = ts.strftime("%H%M")
+    hh   = ts.strftime("%H")        # directory uses hour only
     seg_s = f"S{seg:02d}{SEGMENTS:02d}"
-    fname = f"HS_H08_{ymd}_{hhmm}_{band}_FLDK_{res}_{seg_s}.DAT.bz2"
-    return f"/jma/hsd/{ym}/{d}/{hhmm}/{fname}"
+    fname = f"HS_H09_{ymd}_{hhmm}_{band}_FLDK_{res}_{seg_s}.DAT.bz2"
+    return f"/jma/hsd/{ym}/{d}/{hh}/{fname}"
 
 
 # ---------------------------------------------------------------------------
@@ -283,31 +288,6 @@ def main(
         log.error(str(e))
         log.info(f"Done. Saved 0 frames. out={out} target_saved={TARGET_SAVED}")
         return 0
-
-    # -----------------------------------------------------------------------
-    # Directory probe — list what's actually on the server to verify
-    # path format and see which timestamps are available.
-    # -----------------------------------------------------------------------
-    try:
-        today     = datetime.now(timezone.utc)
-        ym        = today.strftime("%Y%m")
-        d         = today.strftime("%d")
-        base_path = f"/jma/hsd/{ym}/{d}"
-        log.info(f"---- FTP directory probe: {base_path} ----")
-        ftp.cwd(base_path)
-        time_dirs = sorted(ftp.nlst())
-        log.info(f"Available time dirs ({len(time_dirs)} total): {time_dirs[:10]}")
-        if time_dirs:
-            latest_dir = time_dirs[-1]
-            ftp.cwd(latest_dir)
-            files = sorted(ftp.nlst())
-            log.info(f"Files in {base_path}/{latest_dir} ({len(files)} total):")
-            for f in files[:10]:
-                log.info(f"  {f}")
-            ftp.cwd("/")
-    except Exception as e:
-        log.warning(f"Directory probe failed: {e}")
-    # -----------------------------------------------------------------------
 
     saved = checked = 0
 
