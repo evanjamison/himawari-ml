@@ -42,6 +42,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -e .
+          # JAXA P-Tree script requires numpy and pillow
+          pip install numpy pillow
 
       - name: Hourly ingest (save ~24 frames)
         env:
@@ -49,44 +51,34 @@ jobs:
           TARGET_SAVED: "24"
           MAX_FRAMES: "60"
           LOOKBACK_HOURS: "6"
+          PTREE_USER: ${{ secrets.PTREE_USER }}
+          PTREE_PASS: ${{ secrets.PTREE_PASS }}
         run: |
           set -euo pipefail
-
           DAY="$(date -u +%F)"
           OUTDIR="data/raw/${DAY}/latest"
-
           mkdir -p "$OUTDIR"
-
           echo "Ingesting into $OUTDIR"
-
           HIMAWARI_OUT_DIR="$OUTDIR" \
           python -m himawari_ml.ingest.fetch_latest
-
           echo "---- directory contents ----"
           ls -la "$OUTDIR" | head -n 50 || true
 
       - name: Commit raw frames to data
         run: |
           set -euo pipefail
-
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
-
           DAY="$(date -u +%F)"
-
           echo "---- git status BEFORE add ----"
           git status --porcelain || true
-
           # FORCE add today's folder (bypasses .gitignore)
           git add -f "data/raw/${DAY}" || true
-
           echo "---- git status AFTER add ----"
           git status --porcelain || true
-
           if git diff --cached --quiet; then
             echo "No new frames to commit."
             exit 0
           fi
-
           git commit -m "ingest(hourly): ${DAY} $(date -u +'%H:%MZ')"
           git push origin data
