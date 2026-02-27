@@ -1,16 +1,18 @@
 # src/himawari_ml/ingest/fetch_latest.py
 from __future__ import annotations
 
-import os
-import time
+import bz2
+import ftplib
+import io
 import logging
-import warnings
+import os
+import struct
+import time
 from dataclasses import dataclass
-from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
+from pathlib import Path
 
-import requests
+import numpy as np
 from PIL import Image
 
 from himawari_ml.utils.paths import raw_latest_dir, frame_filename
@@ -20,176 +22,297 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s - %(me
 
 IN_GHA = os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 
-# Silence urllib3 "Unverified HTTPS request" warnings when verify=False
-from urllib3.exceptions import InsecureRequestWarning  # type: ignore
-warnings.filterwarnings("ignore", category=InsecureRequestWarning)
+# ---------------------------------------------------------------------------
+# JAXA P-Tree FTP credentials
+# In GitHub Actions: store as repository secrets PTREE_USER and PTREE_PASS
+# and add to the ingest workflow env block.
+# ---------------------------------------------------------------------------
+FTP_HOST = os.getenv("PTREE_HOST", "ftp.ptree.jaxa.jp")
+FTP_USER = os.getenv("PTREE_USER", "")
+FTP_PASS = os.getenv("PTREE_PASS", "")
 
-# Mirrors (try in order)
-BASES = [
-    "https://himawari8-dl.nict.go.jp/himawari8/img",
-    "https://himawari8.nict.go.jp/himawari8/img",
-]
-
-HEADERS = {"User-Agent": "himawari-ml/1.0 (research; GitHub Actions)"}
-
-# ---- Actions-friendly limits (override via env) ----
-TARGET_SAVED = int(os.getenv("TARGET_SAVED", "24" if IN_GHA else "48"))
-MAX_FRAMES_DEFAULT = int(os.getenv("MAX_FRAMES", "96" if IN_GHA else "192"))
+# ---------------------------------------------------------------------------
+# Limits (override via env)
+# ---------------------------------------------------------------------------
+TARGET_SAVED          = int(os.getenv("TARGET_SAVED",    "24" if IN_GHA else "48"))
+MAX_FRAMES_DEFAULT    = int(os.getenv("MAX_FRAMES",      "96" if IN_GHA else "192"))
 LOOKBACK_HOURS_DEFAULT = int(os.getenv("LOOKBACK_HOURS", "48" if IN_GHA else "72"))
+DEFAULT_IMAGE_SIZE    = int(os.getenv("IMAGE_SIZE",      "256"))
 
-# Image size expected by your ML (keep 256 by default)
-DEFAULT_IMAGE_SIZE = int(os.getenv("IMAGE_SIZE", "256"))
-
-# TLS verification override
-_HV = os.getenv("HIMAWARI_VERIFY", "").strip().lower()
-if _HV in ("0", "false", "no"):
-    VERIFY_SSL = False
-elif _HV in ("1", "true", "yes"):
-    VERIFY_SSL = True
-else:
-    VERIFY_SSL = (not IN_GHA)
-
-# Tiling config for full disk (4d / 550 -> 4x4 tiles)
-LEVEL = 4
-TILE_SIZE = 550
+# ---------------------------------------------------------------------------
+# HSD constants
+# Full-disk (FLDK) split into 10 vertical segments: S0110 ... S1010
+# B01=blue (1km/R10), B02=green (1km/R10), B03=red (500m/R05)
+# ---------------------------------------------------------------------------
+SEGMENTS = 10
+BANDS = [
+    ("B01", "R10"),   # blue
+    ("B02", "R10"),   # green
+    ("B03", "R05"),   # red — higher res, downsampled to match B01/B02
+]
 
 
 @dataclass
 class FetchCfg:
     retries: int = 3
-    timeout_s: int = 15
-    backoff_base_s: float = 1.0
+    backoff_base_s: float = 2.0
+    ftp_timeout_s: int = 30
 
 
-PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+# ---------------------------------------------------------------------------
+# FTP helpers
+# ---------------------------------------------------------------------------
 
-
-def _is_png_bytes(b: bytes | None) -> bool:
-    """
-    Relaxed validation:
-      - NO min-size threshold
-      - only require PNG magic bytes
-    This avoids discarding small-but-valid PNGs while still rejecting HTML/error bodies.
-    """
-    if not b:
-        return False
-    return b.startswith(PNG_MAGIC)
-
-
-def _session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    return s
-
-
-def _get(s: requests.Session, url: str, cfg: FetchCfg) -> bytes | None:
-    last_err: Exception | None = None
-    for i in range(cfg.retries):
+def _connect(cfg: FetchCfg) -> ftplib.FTP:
+    """Open and return an authenticated FTP connection to P-Tree."""
+    if not FTP_USER or not FTP_PASS:
+        raise RuntimeError(
+            "PTREE_USER and PTREE_PASS environment variables are not set. "
+            "Add them as GitHub Actions secrets and reference them in your workflow env block."
+        )
+    for attempt in range(cfg.retries):
         try:
-            r = s.get(url, timeout=cfg.timeout_s, verify=VERIFY_SSL)
-            if r.status_code == 404:
-                return None
-            r.raise_for_status()
-
-            b = r.content
-            if not _is_png_bytes(b):
-                # treat as missing/corrupt (often an HTML error page)
-                return None
-            return b
+            ftp = ftplib.FTP(FTP_HOST, timeout=cfg.ftp_timeout_s)
+            ftp.login(FTP_USER, FTP_PASS)
+            ftp.set_pasv(True)
+            log.info(f"FTP connected: {FTP_HOST} as {FTP_USER}")
+            return ftp
         except Exception as e:
-            last_err = e
-            if i == cfg.retries - 1:
-                log.warning(f"Fetch failed: {url} -> {e}")
-            time.sleep(cfg.backoff_base_s * (2**i))
-    if last_err:
-        return None
+            log.warning(f"FTP connect attempt {attempt+1}/{cfg.retries} failed: {e}")
+            if attempt < cfg.retries - 1:
+                time.sleep(cfg.backoff_base_s * (2 ** attempt))
+    raise RuntimeError(f"Could not connect to {FTP_HOST} after {cfg.retries} attempts")
+
+
+def _ftp_read(ftp: ftplib.FTP, remote_path: str, cfg: FetchCfg) -> bytes | None:
+    """Download a single file from FTP into memory. Returns None if not found."""
+    for attempt in range(cfg.retries):
+        try:
+            buf = io.BytesIO()
+            ftp.retrbinary(f"RETR {remote_path}", buf.write)
+            return buf.getvalue()
+        except ftplib.error_perm as e:
+            if "550" in str(e):
+                return None   # file not found — not an error
+            log.warning(f"FTP perm error {remote_path}: {e}")
+            return None
+        except Exception as e:
+            log.warning(f"FTP read attempt {attempt+1} failed for {remote_path}: {e}")
+            if attempt < cfg.retries - 1:
+                time.sleep(cfg.backoff_base_s * (2 ** attempt))
     return None
 
 
+# ---------------------------------------------------------------------------
+# HSD parser
+# Himawari Standard Data format reference:
+# "Himawari Standard Data User's Manual" (JMA/JAXA)
+# ---------------------------------------------------------------------------
+
+def _parse_hsd_segment(data: bytes) -> np.ndarray | None:
+    """
+    Parse a decompressed HSD segment and return float32 reflectance [0,1].
+
+    HSD block layout (big-endian by default):
+      Block 1  (282 bytes) — basic info: lines, columns, bits per pixel
+      Block 2  (  4 bytes) — data info
+      Block 3  ( 50 bytes) — projection
+      Block 4  (127 bytes) — navigation
+      Block 5  (115 bytes) — calibration: slope + intercept at offsets 3 and 11
+      Blocks 6-11          — other metadata
+      Data                 — 16-bit unsigned pixel counts
+    """
+    try:
+        block1 = data[0:282]
+        endian = ">" if struct.unpack_from("B", block1, 5)[0] == 0 else "<"
+
+        nlines = struct.unpack_from(f"{endian}H", block1, 164)[0]
+        ncols  = struct.unpack_from(f"{endian}H", block1, 166)[0]
+
+        # Calibration block starts at byte 463 (282+4+50+127)
+        calib_offset = 282 + 4 + 50 + 127
+        slope     = struct.unpack_from(f"{endian}d", data, calib_offset + 3)[0]
+        intercept = struct.unpack_from(f"{endian}d", data, calib_offset + 11)[0]
+
+        # Total header size stored in block 1 at offset 274 (uint32)
+        total_header = struct.unpack_from(f"{endian}I", block1, 274)[0]
+
+        raw = np.frombuffer(data[total_header:], dtype=np.dtype(f"{endian}u2"))
+
+        if raw.size < nlines * ncols:
+            log.warning(f"HSD: expected {nlines*ncols} pixels, got {raw.size}")
+            return None
+
+        raw = raw[:nlines * ncols].reshape(nlines, ncols).astype(np.float32)
+
+        invalid     = (raw == 0) | (raw == 65535)
+        reflectance = np.clip(raw * slope + intercept, 0.0, 1.0)
+        reflectance[invalid] = 0.0
+
+        return reflectance
+
+    except Exception as e:
+        log.warning(f"HSD parse error: {e}")
+        return None
+
+
+def _remote_path(ts: datetime, band: str, res: str, seg: int) -> str:
+    """
+    Build JAXA P-Tree FTP path.
+    /jma/hsd/YYYYMM/DD/HHmm/HS_H08_YYYYMMDD_HHmm_Bxx_FLDK_Rxx_Sxxx0.DAT.bz2
+    """
+    ym   = ts.strftime("%Y%m")
+    d    = ts.strftime("%d")
+    ymd  = ts.strftime("%Y%m%d")
+    hhmm = ts.strftime("%H%M")
+    seg_s = f"S{seg:02d}{SEGMENTS:02d}"
+    fname = f"HS_H08_{ymd}_{hhmm}_{band}_FLDK_{res}_{seg_s}.DAT.bz2"
+    return f"/jma/hsd/{ym}/{d}/{hhmm}/{fname}"
+
+
+# ---------------------------------------------------------------------------
+# Frame fetch
+# ---------------------------------------------------------------------------
+
+def fetch_frame(
+    ts: datetime,
+    out_dir: Path,
+    image_size: int,
+    cfg: FetchCfg,
+    ftp: ftplib.FTP,
+) -> bool:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / frame_filename(ts)
+
+    if out_path.exists():
+        log.info(f"Already exists, skipping: {out_path.name}")
+        return True
+
+    band_arrays: dict[str, np.ndarray] = {}
+
+    for band, res in BANDS:
+        segments: list[np.ndarray] = []
+
+        for seg in range(1, SEGMENTS + 1):
+            remote = _remote_path(ts, band, res, seg)
+            compressed = _ftp_read(ftp, remote, cfg)
+
+            if compressed is None:
+                log.warning(f"Missing: {remote}")
+                break
+
+            try:
+                raw_bytes = bz2.decompress(compressed)
+            except Exception as e:
+                log.warning(f"bz2 decompress failed {remote}: {e}")
+                break
+
+            arr = _parse_hsd_segment(raw_bytes)
+            if arr is None:
+                break
+
+            segments.append(arr)
+
+        if len(segments) != SEGMENTS:
+            log.warning(f"Band {band} incomplete ({len(segments)}/{SEGMENTS}) for {ts.isoformat()}")
+            return False
+
+        band_arrays[band] = np.concatenate(segments, axis=0)
+
+    if len(band_arrays) != len(BANDS):
+        return False
+
+    # Align resolutions: B03 (500m) → downsample to B01/B02 (1km) size
+    h_ref = band_arrays["B01"].shape[0]
+    w_ref = band_arrays["B01"].shape[1]
+
+    def _resize_band(arr: np.ndarray) -> np.ndarray:
+        if arr.shape == (h_ref, w_ref):
+            return arr
+        pil = Image.fromarray((arr * 255).astype(np.uint8))
+        pil = pil.resize((w_ref, h_ref), Image.BILINEAR)
+        return np.array(pil).astype(np.float32) / 255.0
+
+    r = _resize_band(band_arrays["B03"])
+    g = _resize_band(band_arrays["B02"])
+    b = _resize_band(band_arrays["B01"])
+
+    rgb = np.clip(np.stack([r, g, b], axis=-1) * 255, 0, 255).astype(np.uint8)
+
+    img  = Image.fromarray(rgb)
+    w, h = img.size
+    side = min(w, h)
+    img  = img.crop(((w-side)//2, (h-side)//2, (w+side)//2, (h+side)//2))
+    img  = img.resize((image_size, image_size), Image.BILINEAR)
+    img.save(out_path)
+
+    log.info(f"Saved {out_path.name}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def latest_timestamp_10min() -> datetime:
-    now = datetime.now(timezone.utc)
+    now    = datetime.now(timezone.utc)
     minute = (now.minute // 10) * 10
     return now.replace(minute=minute, second=0, microsecond=0)
 
 
-def _center_crop_square(img: Image.Image) -> Image.Image:
-    w, h = img.size
-    side = min(w, h)
-    left = (w - side) // 2
-    top = (h - side) // 2
-    return img.crop((left, top, left + side, top + side))
-
-
-def fetch_frame(ts: datetime, out_dir: Path, image_size: int, cfg: FetchCfg) -> bool:
-    y, m, d = ts.strftime("%Y"), ts.strftime("%m"), ts.strftime("%d")
-    hms = ts.strftime("%H%M%S")
-    rel_prefix = f"D531106/{LEVEL}d/{TILE_SIZE}/{y}/{m}/{d}/{hms}"
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / frame_filename(ts)  # full UTC timestamp filename
-
-    s = _session()
-
-    for base in BASES:
-        try:
-            tiles: list[list[Image.Image]] = []
-            for ty in range(LEVEL):
-                row: list[Image.Image] = []
-                for tx in range(LEVEL):
-                    url = f"{base}/{rel_prefix}_{tx}_{ty}.png"
-                    b = _get(s, url, cfg)
-                    if b is None:
-                        raise RuntimeError(f"tile missing/corrupt ({tx},{ty})")
-                    im = Image.open(BytesIO(b)).convert("RGB")
-                    row.append(im)
-                tiles.append(row)
-
-            full = Image.new("RGB", (LEVEL * TILE_SIZE, LEVEL * TILE_SIZE))
-            for ty in range(LEVEL):
-                for tx in range(LEVEL):
-                    full.paste(tiles[ty][tx], (tx * TILE_SIZE, ty * TILE_SIZE))
-
-            cropped = _center_crop_square(full)
-            resized = cropped.resize((image_size, image_size), Image.BILINEAR)
-
-            # ✅ No darkness filter — always save if stitched successfully
-            resized.save(out_path)
-            log.info(f"Saved {out_path}")
-            return True
-
-        except Exception as e:
-            log.warning(f"Base failed: {base} -> {e}")
-
-    log.warning(f"All sources failed for {rel_prefix}_x_y.png (stitched)")
-    return False
-
-
 def main(
     lookback_hours: int = LOOKBACK_HOURS_DEFAULT,
-    max_frames: int = MAX_FRAMES_DEFAULT,
-    image_size: int = DEFAULT_IMAGE_SIZE,
+    max_frames: int     = MAX_FRAMES_DEFAULT,
+    image_size: int     = DEFAULT_IMAGE_SIZE,
 ) -> int:
-    # Production default: data/raw/YYYY-MM-DD/latest/
-    # Optional override: HIMAWARI_OUT_DIR=/some/path
-    out = Path(os.getenv("HIMAWARI_OUT_DIR", "")).expanduser() if os.getenv("HIMAWARI_OUT_DIR") else raw_latest_dir()
+    out = (
+        Path(os.getenv("HIMAWARI_OUT_DIR", "")).expanduser()
+        if os.getenv("HIMAWARI_OUT_DIR")
+        else raw_latest_dir()
+    )
 
-    ts = latest_timestamp_10min()
+    ts     = latest_timestamp_10min()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    cfg    = FetchCfg()
 
-    cfg = FetchCfg()
+    log.info(f"JAXA P-Tree ingest: lookback={lookback_hours}h target={TARGET_SAVED} out={out}")
 
-    saved = 0
-    checked = 0
+    try:
+        ftp = _connect(cfg)
+    except RuntimeError as e:
+        log.error(str(e))
+        log.info(f"Done. Saved 0 frames. out={out} target_saved={TARGET_SAVED}")
+        return 0
 
-    while checked < max_frames and ts >= cutoff and saved < TARGET_SAVED:
-        checked += 1
-        if fetch_frame(ts, out, image_size=image_size, cfg=cfg):
-            saved += 1
-        ts -= timedelta(minutes=10)
+    saved = checked = 0
+
+    try:
+        while checked < max_frames and ts >= cutoff and saved < TARGET_SAVED:
+            checked += 1
+            try:
+                if fetch_frame(ts, out, image_size=image_size, cfg=cfg, ftp=ftp):
+                    saved += 1
+            except ftplib.all_errors as e:
+                log.warning(f"FTP error on {ts.isoformat()}, reconnecting: {e}")
+                try:
+                    ftp.quit()
+                except Exception:
+                    pass
+                try:
+                    ftp = _connect(cfg)
+                except RuntimeError:
+                    log.error("Could not reconnect, stopping.")
+                    break
+            ts -= timedelta(minutes=10)
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
 
     log.info(
         f"Done. Saved {saved} frames (checked {checked}). "
-        f"out={out} verify_ssl={VERIFY_SSL} target_saved={TARGET_SAVED}"
+        f"out={out} target_saved={TARGET_SAVED}"
     )
     return 0
 
@@ -204,7 +327,7 @@ if __name__ == "__main__":
             return default
 
     lb = _to_int(sys.argv[1], LOOKBACK_HOURS_DEFAULT) if len(sys.argv) > 1 else LOOKBACK_HOURS_DEFAULT
-    mf = _to_int(sys.argv[2], MAX_FRAMES_DEFAULT) if len(sys.argv) > 2 else MAX_FRAMES_DEFAULT
-    sz = _to_int(sys.argv[3], DEFAULT_IMAGE_SIZE) if len(sys.argv) > 3 else DEFAULT_IMAGE_SIZE
+    mf = _to_int(sys.argv[2], MAX_FRAMES_DEFAULT)     if len(sys.argv) > 2 else MAX_FRAMES_DEFAULT
+    sz = _to_int(sys.argv[3], DEFAULT_IMAGE_SIZE)      if len(sys.argv) > 3 else DEFAULT_IMAGE_SIZE
 
     raise SystemExit(main(lookback_hours=lb, max_frames=mf, image_size=sz))
