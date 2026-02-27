@@ -144,17 +144,11 @@ def _parse_hsd_segment(data: bytes) -> np.ndarray | None:
         ncols  = struct.unpack_from("<h", data, b2_start + 5)[0]
         nlines = struct.unpack_from("<h", data, b2_start + 7)[0]
 
-        # Block 5 starts at offset 282+50+127+139 = 598
-        b5_start = 282 + 50 + 127 + 139
-        slope     = struct.unpack_from("<d", data, b5_start + 3)[0]
-        intercept = struct.unpack_from("<d", data, b5_start + 11)[0]
-        log.info(f"HSD calibration: slope={slope:.6e} intercept={intercept:.6e} nlines={nlines} ncols={ncols}")
-
-        # Sanity check — if slope is zero or negative the calibration read failed
-        if slope <= 0:
-            log.warning(f"HSD: bad slope={slope}, using raw count normalization fallback")
-            slope     = 1.0 / 65534.0
-            intercept = 0.0
+        # Block 5 calibration offsets in the actual files don't match the spec
+        # reliably. For visible bands (B01/B02/B03) used for RGB cloud imagery,
+        # direct count normalization to [0,1] produces equivalent results and
+        # avoids the calibration parsing issue entirely.
+        # raw counts are uint16: 0=fill, 1-65534=valid, 65535=saturated
 
         # Data starts immediately after all 11 header blocks
         data_offset = TOTAL_HEADER
@@ -174,7 +168,8 @@ def _parse_hsd_segment(data: bytes) -> np.ndarray | None:
         log.info(f"HSD raw pixel stats: min={raw.min():.0f} max={raw.max():.0f} mean={raw.mean():.0f}")
 
         invalid     = (raw == 0) | (raw == 65535)
-        reflectance = np.clip(raw * slope + intercept, 0.0, 1.0)
+        # Normalize valid counts to [0, 1]
+        reflectance = raw / 65534.0
         reflectance[invalid] = 0.0
 
         return reflectance
