@@ -24,11 +24,7 @@ IN_GHA = os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 from urllib3.exceptions import InsecureRequestWarning  # type: ignore
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
-# ---------------------------------------------------------------------------
-# Mirrors — tried in order, first success wins.
-# If NICT blocks GitHub Actions IPs, contact osn-system@ml.nict.go.jp
-# to request whitelisting of GitHub Actions IP ranges for research use.
-# ---------------------------------------------------------------------------
+# Mirrors (try in order)
 BASES = [
     "https://himawari8-dl.nict.go.jp/himawari8/img",
     "https://himawari8.nict.go.jp/himawari8/img",
@@ -69,6 +65,12 @@ PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
 def _is_png_bytes(b: bytes | None) -> bool:
+    """
+    Relaxed validation:
+      - NO min-size threshold
+      - only require PNG magic bytes
+    This avoids discarding small-but-valid PNGs while still rejecting HTML/error bodies.
+    """
     if not b:
         return False
     return b.startswith(PNG_MAGIC)
@@ -85,18 +87,13 @@ def _get(s: requests.Session, url: str, cfg: FetchCfg) -> bytes | None:
     for i in range(cfg.retries):
         try:
             r = s.get(url, timeout=cfg.timeout_s, verify=VERIFY_SSL)
-            if r.status_code == 403:
-                log.warning(
-                    f"403 Forbidden: {url} — NICT is blocking this IP. "
-                    f"Contact osn-system@ml.nict.go.jp to request whitelisting."
-                )
-                return None  # don't retry 403 — it won't recover
             if r.status_code == 404:
                 return None
             r.raise_for_status()
 
             b = r.content
             if not _is_png_bytes(b):
+                # treat as missing/corrupt (often an HTML error page)
                 return None
             return b
         except Exception as e:
@@ -129,37 +126,23 @@ def fetch_frame(ts: datetime, out_dir: Path, image_size: int, cfg: FetchCfg) -> 
     rel_prefix = f"D531106/{LEVEL}d/{TILE_SIZE}/{y}/{m}/{d}/{hms}"
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / frame_filename(ts)
-
-    if out_path.exists():
-        log.info(f"Already exists, skipping: {out_path.name}")
-        return True
+    out_path = out_dir / frame_filename(ts)  # full UTC timestamp filename
 
     s = _session()
 
     for base in BASES:
         try:
             tiles: list[list[Image.Image]] = []
-            failed = False
-
             for ty in range(LEVEL):
-                if failed:
-                    break
                 row: list[Image.Image] = []
                 for tx in range(LEVEL):
                     url = f"{base}/{rel_prefix}_{tx}_{ty}.png"
                     b = _get(s, url, cfg)
                     if b is None:
-                        log.warning(f"Base failed: {base} -> tile missing/corrupt ({tx},{ty})")
-                        failed = True
-                        break
+                        raise RuntimeError(f"tile missing/corrupt ({tx},{ty})")
                     im = Image.open(BytesIO(b)).convert("RGB")
                     row.append(im)
-                if not failed:
-                    tiles.append(row)
-
-            if failed:
-                continue  # try next mirror
+                tiles.append(row)
 
             full = Image.new("RGB", (LEVEL * TILE_SIZE, LEVEL * TILE_SIZE))
             for ty in range(LEVEL):
@@ -169,8 +152,9 @@ def fetch_frame(ts: datetime, out_dir: Path, image_size: int, cfg: FetchCfg) -> 
             cropped = _center_crop_square(full)
             resized = cropped.resize((image_size, image_size), Image.BILINEAR)
 
+            # ✅ No darkness filter — always save if stitched successfully
             resized.save(out_path)
-            log.info(f"Saved {out_path.name} (mirror: {base})")
+            log.info(f"Saved {out_path}")
             return True
 
         except Exception as e:
@@ -185,17 +169,14 @@ def main(
     max_frames: int = MAX_FRAMES_DEFAULT,
     image_size: int = DEFAULT_IMAGE_SIZE,
 ) -> int:
-    out = (
-        Path(os.getenv("HIMAWARI_OUT_DIR", "")).expanduser()
-        if os.getenv("HIMAWARI_OUT_DIR")
-        else raw_latest_dir()
-    )
+    # Production default: data/raw/YYYY-MM-DD/latest/
+    # Optional override: HIMAWARI_OUT_DIR=/some/path
+    out = Path(os.getenv("HIMAWARI_OUT_DIR", "")).expanduser() if os.getenv("HIMAWARI_OUT_DIR") else raw_latest_dir()
 
     ts = latest_timestamp_10min()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    cfg = FetchCfg()
 
-    log.info(f"NICT Himawari ingest: lookback={lookback_hours}h target={TARGET_SAVED} out={out}")
+    cfg = FetchCfg()
 
     saved = 0
     checked = 0
@@ -223,7 +204,7 @@ if __name__ == "__main__":
             return default
 
     lb = _to_int(sys.argv[1], LOOKBACK_HOURS_DEFAULT) if len(sys.argv) > 1 else LOOKBACK_HOURS_DEFAULT
-    mf = _to_int(sys.argv[2], MAX_FRAMES_DEFAULT)     if len(sys.argv) > 2 else MAX_FRAMES_DEFAULT
-    sz = _to_int(sys.argv[3], DEFAULT_IMAGE_SIZE)      if len(sys.argv) > 3 else DEFAULT_IMAGE_SIZE
+    mf = _to_int(sys.argv[2], MAX_FRAMES_DEFAULT) if len(sys.argv) > 2 else MAX_FRAMES_DEFAULT
+    sz = _to_int(sys.argv[3], DEFAULT_IMAGE_SIZE) if len(sys.argv) > 3 else DEFAULT_IMAGE_SIZE
 
     raise SystemExit(main(lookback_hours=lb, max_frames=mf, image_size=sz))
