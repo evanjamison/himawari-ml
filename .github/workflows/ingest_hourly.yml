@@ -56,9 +56,9 @@ jobs:
       - name: Hourly ingest (save ~24 frames)
         env:
           PYTHONUNBUFFERED: "1"
-          TARGET_SAVED: "24"
-          MAX_FRAMES: "60"
-          LOOKBACK_HOURS: "6"
+          TARGET_SAVED: "6"
+          MAX_FRAMES: "12"
+          LOOKBACK_HOURS: "2"
           PTREE_USER: ${{ secrets.PTREE_USER }}
           PTREE_PASS: ${{ secrets.PTREE_PASS }}
         run: |
