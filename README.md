@@ -8,7 +8,7 @@ Built by [Evan Jamison](https://github.com/evanjamison) · Python · PyTorch · 
 
 ## Overview
 
-This project builds a fully automated pipeline that ingests live satellite imagery from JAXA's Himawari-9 geostationary satellite every hour, generates cloud segmentation labels, and trains deep learning models to detect and predict cloud motion over the Asia-Pacific region.
+This project builds a fully automated pipeline that ingests live satellite imagery from the NICT Himawari Real-time Web every hour, generates cloud segmentation labels, and trains deep learning models to detect and predict cloud motion over the Asia-Pacific region.
 
 The central research question: **does temporal context improve cloud segmentation?** A U-Net operating on single frames is compared against a ConvLSTM that sees six consecutive frames, revealing that temporal information allows the model to substantially transcend the limitations of its own training labels.
 
@@ -29,15 +29,15 @@ The ConvLSTM's strong performance — despite training on the same imperfect bas
 
 ### 1. Automated Data Ingestion at Scale
 
-Himawari-9 produces a full-disk image of Earth every 10 minutes. This project ingests that data automatically via a GitHub Actions workflow (`ingest-hourly`) that runs every hour, downloading raw HSD (Himawari Standard Data) files from JAXA's P-Tree FTP archive, stitching 10 vertical segments per band across 3 visible bands (B01/B02/B03), and saving calibrated 256×256 RGB frames to a dedicated `data` branch.
+Himawari-9 produces a full-disk image of Earth every 10 minutes. This project ingests that data automatically via a GitHub Actions workflow (`ingest-hourly`) that runs every hour, downloading and stitching 4×4 PNG tiles from the NICT Himawari Real-time Web API, and saving 256×256 RGB composites to a dedicated `data` branch.
 
-Over 60 days of continuous operation, the pipeline has collected **1,400+ frames** without manual intervention.
+Over 60 days of continuous operation, the pipeline has collected **7,000+ frames** without manual intervention.
 
-### 2. Production Outage and Source Migration
+### 2. Production Outage Diagnosis and Recovery
 
-Midway through data collection, the primary NICT tile server began returning 403 Forbidden responses for GitHub Actions runner IP ranges — effectively blocking the pipeline. Rather than abandon the project, the ingestion module was rewritten to target JAXA's P-Tree FTP archive directly, requiring implementation of a custom HSD binary format parser (bz2 decompression → 16-bit count extraction → reflectance normalization → gamma correction) to reproduce the RGB composite that the NICT tile server had previously handled transparently.
+Midway through data collection, the NICT tile server began returning 403 Forbidden responses for GitHub Actions runner IP ranges, halting ingestion entirely. Diagnosing the failure required distinguishing between rate limiting, IP blocking, and data source changes — ultimately confirmed by isolating the 403 pattern to specific GitHub-hosted runner IPs.
 
-This forced a deep understanding of the satellite data format that would not have been necessary with a higher-level API.
+As a contingency, the ingestion module was partially rewritten to target JAXA's P-Tree FTP archive directly, requiring implementation of a custom HSD binary format parser (bz2 decompression → 16-bit count extraction → reflectance normalization → gamma correction). The block proved temporary — NICT's IP rotation resolved it — but the investigation produced a working understanding of the underlying satellite data format and a fallback ingestion path for future outages.
 
 ### 3. Label Quality and Threshold Sensitivity
 
@@ -53,7 +53,7 @@ Code and data are maintained on separate git branches (`main` and `data`) to avo
 
 ```
 ingest-hourly (GitHub Actions, runs every hour)
-    └── JAXA P-Tree FTP → HSD parse → RGB composite → data branch
+    └── NICT Himawari Real-time Web → 4×4 tile stitch → 256×256 RGB → data branch
 
 daily_rollup_phase2 (GitHub Actions, runs daily)
     ├── Phase 2: Storm tracking visualizations
@@ -73,7 +73,7 @@ himawari-ml/
 │   └── daily_rollup_phase2.yml  # Daily training pipeline
 ├── src/himawari_ml/
 │   ├── ingest/
-│   │   └── fetch_latest.py      # JAXA P-Tree FTP ingestion + HSD parser
+│   │   └── fetch_latest.py      # NICT tile ingestion + stitch pipeline
 │   ├── models/
 │   │   ├── train_unet_pixelmask.py
 │   │   └── train_convlstm.py
@@ -127,7 +127,7 @@ python scripts/experiments/segmentation/cloud_mask_baseline_v2.py \
 
 Frames are stored on the `data` branch under `data/raw/YYYY-MM-DD/latest/` and are not included in the main branch history. The ingestion workflow commits new frames hourly; the daily rollup consumes them for training.
 
-Data source: [JAXA Himawari Monitor P-Tree](https://www.eorc.jaxa.jp/ptree/) (registration required for FTP access).
+Data source: [NICT Himawari Real-time Web](https://himawari8.nict.go.jp/) (open access, non-commercial research use).
 
 ---
 
@@ -135,4 +135,4 @@ Data source: [JAXA Himawari Monitor P-Tree](https://www.eorc.jaxa.jp/ptree/) (re
 
 - **Label quality**: The HSV baseline captures dense cloud systems well but misses thin cirrus, which requires infrared channels. All metrics reflect agreement with the baseline definition rather than absolute meteorological accuracy.
 - **Validation**: Cross-validation against JMA operational cloud products or MODIS observations would strengthen the scientific claims.
-- **Ingestion latency**: JAXA P-Tree data is available ~30–60 minutes after observation, introducing a small lag relative to real-time applications.
+- **Ingestion latency**: NICT tiles are available within minutes of observation, making the pipeline suitable for near-real-time applications with minor scheduling adjustments.
