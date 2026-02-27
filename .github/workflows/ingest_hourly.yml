@@ -32,7 +32,7 @@ jobs:
           git switch data || git switch -c data
           git merge origin/main --no-edit || true
 
-      - name: Clear Python cache (ensure fresh code runs)
+      - name: Clear Python cache
         run: find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
       - name: Setup Python
@@ -45,30 +45,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -e .
-          pip install numpy pillow
-
-      - name: Verify fetch_latest is JAXA P-Tree version
-        run: |
-          echo "---- fetch_latest.py source check ----"
-          grep -n "PTREE\|ftplib\|jaxa\|nict" src/himawari_ml/ingest/fetch_latest.py || true
-          echo "---- end check ----"
 
       - name: Hourly ingest (save ~24 frames)
         env:
           PYTHONUNBUFFERED: "1"
-          TARGET_SAVED: "6"
-          MAX_FRAMES: "12"
-          LOOKBACK_HOURS: "2"
-          PTREE_USER: ${{ secrets.PTREE_USER }}
-          PTREE_PASS: ${{ secrets.PTREE_PASS }}
+          TARGET_SAVED: "24"
+          MAX_FRAMES: "60"
+          LOOKBACK_HOURS: "6"
         run: |
           set -euo pipefail
           DAY="$(date -u +%F)"
           OUTDIR="data/raw/${DAY}/latest"
           mkdir -p "$OUTDIR"
           echo "Ingesting into $OUTDIR"
-          echo "PTREE_USER is set: $( [ -n "$PTREE_USER" ] && echo YES || echo NO )"
-          echo "PTREE_PASS is set: $( [ -n "$PTREE_PASS" ] && echo YES || echo NO )"
           HIMAWARI_OUT_DIR="$OUTDIR" \
           python -m himawari_ml.ingest.fetch_latest
           echo "---- directory contents ----"
