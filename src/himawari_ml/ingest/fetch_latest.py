@@ -257,7 +257,7 @@ def fetch_frame(
 def latest_timestamp_10min() -> datetime:
     now    = datetime.now(timezone.utc)
     minute = (now.minute // 10) * 10
-    return now.replace(minute=minute, second=0, microsecond=0)
+    return now.replace(minute=minute, second=0, microsecond=0) - timedelta(hours=1)
 
 
 def main(
