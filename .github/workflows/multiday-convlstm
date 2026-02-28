@@ -1,0 +1,255 @@
+name: multiday-convlstm
+
+on:
+  workflow_run:
+    workflows: ["multiday-rollup"]
+    types:
+      - completed
+  # Also allow manual trigger in case you want to re-run ConvLSTM without re-running U-Net
+  workflow_dispatch:
+    inputs:
+      convlstm_epochs:
+        description: "ConvLSTM training epochs."
+        required: false
+        default: "25"
+      convlstm_seq_len:
+        description: "ConvLSTM sequence length (T)."
+        required: false
+        default: "6"
+      convlstm_rollout_k:
+        description: "ConvLSTM rollout steps (K)."
+        required: false
+        default: "2"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: multiday-convlstm
+  cancel-in-progress: false
+
+jobs:
+  convlstm:
+    runs-on: ubuntu-latest
+
+    # Only run if triggered by a successful multiday-rollup, or manually
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    env:
+      CONVLSTM_EPOCHS:    ${{ github.event.inputs.convlstm_epochs    || '25' }}
+      CONVLSTM_SEQ_LEN:   ${{ github.event.inputs.convlstm_seq_len   || '6' }}
+      CONVLSTM_ROLLOUT_K: ${{ github.event.inputs.convlstm_rollout_k || '2' }}
+
+    steps:
+      - name: Checkout data branch
+        uses: actions/checkout@v4
+        with:
+          ref: data
+          fetch-depth: 0
+
+      - name: Configure git identity
+        shell: bash
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@users.noreply.github.com"
+
+      - name: Bring pipeline code from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main --depth=1
+          git checkout origin/main -- src scripts ml requirements.txt pyproject.toml || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+
+      # Read the handoff.json written by multiday-rollup to find all paths
+      - name: Resolve handoff paths
+        id: paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          HANDOFF=$(find out -name "handoff.json" | sort | tail -n 1)
+
+          if [[ -z "$HANDOFF" ]]; then
+            echo "ERROR: No handoff.json found under out/. Did multiday-rollup finish successfully?"
+            find out -maxdepth 4 -type f | head -n 20 || true
+            exit 1
+          fi
+
+          echo "Found: $HANDOFF"
+          cat "$HANDOFF"
+
+          # Parse each field out with grep+sed — no python quoting issues
+          parse() { grep ""$1"" "$HANDOFF" | sed 's/.*": *"\(.*\)".*/\1/'; }
+
+          echo "label=$(parse label)"               >> "$GITHUB_OUTPUT"
+          echo "day=$(parse day)"                   >> "$GITHUB_OUTPUT"
+          echo "outdir=$(parse outdir)"             >> "$GITHUB_OUTPUT"
+          echo "outframes=$(parse outframes)"       >> "$GITHUB_OUTPUT"
+          echo "canon_out=$(parse canon_out)"       >> "$GITHUB_OUTPUT"
+          echo "model_path=$(parse model_path)"     >> "$GITHUB_OUTPUT"
+          echo "lookback_days=$(parse lookback_days)" >> "$GITHUB_OUTPUT"
+
+          echo "--- resolved ---"
+          cat "$GITHUB_OUTPUT" | grep -v '^$' || true
+
+      - name: Verify required paths exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUTFRAMES="${{ steps.paths.outputs.outframes }}"
+          CANON_OUT="${{ steps.paths.outputs.canon_out }}"
+
+          echo "outframes: $OUTFRAMES"
+          echo "canon_out: $CANON_OUT"
+
+          [[ -d "$OUTFRAMES" ]]          || { echo "ERROR: outframes missing: $OUTFRAMES"; exit 1; }
+          [[ -d "$CANON_OUT/masks_unet" ]] || { echo "ERROR: masks missing: $CANON_OUT/masks_unet"; exit 1; }
+
+          echo "Frame count: $(ls $OUTFRAMES/*.png 2>/dev/null | wc -l)"
+          echo "Mask count:  $(ls $CANON_OUT/masks_unet/*.png 2>/dev/null | wc -l)"
+
+      - name: Phase 4A - Build ConvLSTM CSV
+        id: p4csv
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUTDIR="${{ steps.paths.outputs.outdir }}"
+          mkdir -p "$OUTDIR/phase4_convlstm"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, pandas as pd, os
+
+          rawdir  = Path(os.environ["OUTFRAMES"])
+          canon   = Path(os.environ["CANON_OUT"]) / "masks_unet"
+          outcsv  = Path(os.environ["OUTDIR"]) / "phase4_convlstm" / "convlstm_metrics.csv"
+
+          def ts(name):
+              m = re.search(r"himawari_(\d{8}T\d{6})Z", name)
+              return m.group(1) + "Z" if m else None
+
+          rows = []
+          for f in sorted(rawdir.glob("*.png")):
+              t = ts(f.name)
+              if not t:
+                  continue
+              mask = canon / f"{f.stem}_mask.png"
+              if not mask.exists():
+                  continue
+              rows.append({
+                  "timestamp_utc": t,
+                  "image_path":    str(f).replace("\\", "/"),
+                  "mask_path":     str(mask).replace("\\", "/"),
+              })
+
+          df = pd.DataFrame(rows).sort_values("timestamp_utc").reset_index(drop=True)
+          outcsv.parent.mkdir(parents=True, exist_ok=True)
+          df.to_csv(outcsv, index=False)
+          print(f"Wrote {outcsv}  rows={len(df)}")
+          if len(df) < 4:
+              raise SystemExit(f"Not enough frame/mask pairs ({len(df)}). Need at least 4.")
+          PY
+
+          OUTDIR="${{ steps.paths.outputs.outdir }}"
+          echo "metrics_csv=$OUTDIR/phase4_convlstm/convlstm_metrics.csv" >> "$GITHUB_OUTPUT"
+        env:
+          OUTFRAMES: ${{ steps.paths.outputs.outframes }}
+          CANON_OUT: ${{ steps.paths.outputs.canon_out }}
+          OUTDIR:    ${{ steps.paths.outputs.outdir }}
+
+      - name: Phase 4B - Train ConvLSTM
+        shell: bash
+        run: |
+          set -euo pipefail
+          METRICS="${{ steps.p4csv.outputs.metrics_csv }}"
+          test -f "$METRICS" || { echo "ERROR: missing metrics csv: $METRICS"; exit 1; }
+
+          python -u ml/train_convlstm.py \
+            --metrics-csv "$METRICS" \
+            --outdir out \
+            --seq-len   "${CONVLSTM_SEQ_LEN}" \
+            --rollout-k "${CONVLSTM_ROLLOUT_K}" \
+            --epochs    "${CONVLSTM_EPOCHS}" \
+            --batch-size 2
+
+          ls -la out/models | grep -i convlstm || true
+          ls -la out/viz    | grep -i convlstm || true
+
+      - name: Phase 4C - Evaluate ConvLSTM rollouts
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUTDIR="${{ steps.paths.outputs.outdir }}"
+          ROLLOUT_DIR="$OUTDIR/phase4_convlstm/rollout_eval"
+          mkdir -p "$ROLLOUT_DIR"
+
+          CKPT="out/models/convlstm_ss_best_gray.pt"
+          test -f "$CKPT" || { echo "ERROR: missing ckpt: $CKPT"; exit 1; }
+
+          python -u ml/eval_convlstm_rollout.py \
+            --metrics-csv "${{ steps.p4csv.outputs.metrics_csv }}" \
+            --ckpt        "$CKPT" \
+            --outdir      "$ROLLOUT_DIR" \
+            --seq-len 6 \
+            --rollout-k 2 \
+            --thr 0.30 \
+            --feedback prob \
+            --val-frac 0.20 \
+            --viz-samples 3 \
+            --viz-evenly-spaced \
+            --device cpu
+
+          ls -la "$ROLLOUT_DIR"
+
+      - name: Collect ConvLSTM training curves
+        if: always()
+        shell: bash
+        run: |
+          OUTDIR="${{ steps.paths.outputs.outdir }}"
+          mkdir -p "$OUTDIR/phase4_convlstm"
+          cp out/viz/convlstm_training_curves_ss_gray.png  "$OUTDIR/phase4_convlstm/" 2>/dev/null || true
+          cp out/viz/convlstm_val_previews_ss_gray.png     "$OUTDIR/phase4_convlstm/" 2>/dev/null || true
+          cp out/convlstm_history_ss_gray.csv              "$OUTDIR/phase4_convlstm/" 2>/dev/null || true
+          echo "---- phase4 outputs ----"
+          ls -la "$OUTDIR/phase4_convlstm/" || true
+
+      - name: Upload ConvLSTM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: multiday_convlstm_${{ steps.paths.outputs.label }}_${{ steps.paths.outputs.lookback_days }}d
+          if-no-files-found: warn
+          path: |
+            ${{ steps.paths.outputs.outdir }}/phase4_convlstm
+
+      - name: Commit ConvLSTM results to data branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -f out "${{ steps.paths.outputs.outdir }}" || true
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+
+          LABEL="${{ steps.paths.outputs.label }}"
+          DAYS="${{ steps.paths.outputs.lookback_days }}"
+          git commit -m "multiday-rollup (convlstm done): $LABEL ${DAYS}d"
+          git fetch origin data
+          git pull --rebase --autostash origin data
+          git push origin data
