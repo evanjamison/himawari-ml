@@ -8,29 +8,13 @@ on:
         required: false
         default: "3"
       start_day:
-        description: "Start date (YYYY-MM-DD). Pools start_day + next N-1 days. Leave blank to use most recent N days."
+        description: "Start date (YYYY-MM-DD). Leave blank to use most recent N days."
         required: false
         default: ""
       unet_epochs:
         description: "U-Net training epochs."
         required: false
         default: "40"
-      convlstm_epochs:
-        description: "ConvLSTM training epochs."
-        required: false
-        default: "25"
-      enable_phase4:
-        description: "Run Phase 4 ConvLSTM training (1=yes, 0=no)."
-        required: false
-        default: "1"
-      convlstm_seq_len:
-        description: "ConvLSTM sequence length (T)."
-        required: false
-        default: "6"
-      convlstm_rollout_k:
-        description: "ConvLSTM rollout steps (K)."
-        required: false
-        default: "2"
       luma_thresh:
         description: "Baseline luma threshold. Lower = more clouds detected."
         required: false
@@ -56,16 +40,12 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      ENABLE_PHASE4:     ${{ github.event.inputs.enable_phase4     || '1' }}
-      LOOKBACK_DAYS:     ${{ github.event.inputs.lookback_days     || '3' }}
-      START_DAY:         ${{ github.event.inputs.start_day         || '' }}
-      UNET_EPOCHS:       ${{ github.event.inputs.unet_epochs       || '60' }}
-      CONVLSTM_EPOCHS:   ${{ github.event.inputs.convlstm_epochs   || '25' }}
-      CONVLSTM_SEQ_LEN:  ${{ github.event.inputs.convlstm_seq_len  || '6' }}
-      CONVLSTM_ROLLOUT_K: ${{ github.event.inputs.convlstm_rollout_k || '2' }}
-      LUMA_THRESH:       ${{ github.event.inputs.luma_thresh       || '0.35' }}
-      SAT_THRESH:        ${{ github.event.inputs.sat_thresh        || '0.30' }}
-      MIN_AREA:          ${{ github.event.inputs.min_area          || '60' }}
+      LOOKBACK_DAYS:  ${{ github.event.inputs.lookback_days || '3' }}
+      START_DAY:      ${{ github.event.inputs.start_day     || '' }}
+      UNET_EPOCHS:    ${{ github.event.inputs.unet_epochs   || '40' }}
+      LUMA_THRESH:    ${{ github.event.inputs.luma_thresh   || '0.35' }}
+      SAT_THRESH:     ${{ github.event.inputs.sat_thresh    || '0.30' }}
+      MIN_AREA:       ${{ github.event.inputs.min_area      || '60' }}
 
     steps:
       - name: Checkout data branch
@@ -77,23 +57,15 @@ jobs:
       - name: Configure git identity
         shell: bash
         run: |
-          set -euo pipefail
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@users.noreply.github.com"
 
-      - name: Bring pipeline code from main (no merge)
+      - name: Bring pipeline code from main
         shell: bash
         run: |
           set -euo pipefail
           git fetch origin main --depth=1
           git checkout origin/main -- src scripts ml requirements.txt pyproject.toml || true
-
-          ls -la scripts/pipeline/filter_black_frames.py
-          ls -la scripts/pipeline/run_sample_pipeline.py
-          ls -la scripts/experiments/segmentation/cloud_mask_baseline_v2.py
-          ls -la ml/train_unet_pixelmask.py
-          ls -la ml/infer_unet_pixelmask.py
-          ls -la ml/train_convlstm.py
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -109,7 +81,7 @@ jobs:
           pip install -e .
           pip install opencv-python-headless
 
-      - name: Resolve target DAY (most recent available)
+      - name: Resolve target DAY
         id: resolve
         shell: bash
         run: |
@@ -117,105 +89,62 @@ jobs:
           RAWROOT="data/raw"
 
           [[ -d "$RAWROOT" ]] || { echo "ERROR: $RAWROOT missing"; exit 1; }
+          mapfile -t ALL_DAYS < <(find "$RAWROOT" -maxdepth 1 -mindepth 1 -type d -name "????-??-??" -printf "%f\n" | sort)
+          [[ ${#ALL_DAYS[@]} -gt 0 ]] || { echo "ERROR: No YYYY-MM-DD folders found"; exit 1; }
 
-          mapfile -t DAYS < <(find "$RAWROOT" -maxdepth 1 -mindepth 1 -type d -name "????-??-??" -printf "%f\n" | sort)
-
-          [[ ${#DAYS[@]} -gt 0 ]] || { echo "ERROR: No YYYY-MM-DD folders found"; exit 1; }
-
-          DAY="${DAYS[-1]}"
-          DAYDIR="$RAWROOT/$DAY"
-          OUTMASTER="$DAYDIR/master_multiday"
-          OUTFRAMES="$OUTMASTER/frames"
-
-          # Use start_day in artifact name if pinned, otherwise use most recent day
-          if [[ -n "${START_DAY}" ]]; then
-            LABEL="${START_DAY}"
-          else
-            LABEL="$DAY"
-          fi
+          DAY="${ALL_DAYS[-1]}"
+          LABEL="${START_DAY:-$DAY}"
           OUTDIR="out/${LABEL}_multiday${LOOKBACK_DAYS}d"
+          OUTFRAMES="$OUTDIR/frames"
 
-          echo "day=$DAY"               >> "$GITHUB_OUTPUT"
-          echo "label=$LABEL"           >> "$GITHUB_OUTPUT"
-          echo "daydir=$DAYDIR"         >> "$GITHUB_OUTPUT"
-          echo "outframes=$OUTFRAMES"   >> "$GITHUB_OUTPUT"
-          echo "outdir=$OUTDIR"         >> "$GITHUB_OUTPUT"
+          echo "day=$DAY"             >> "$GITHUB_OUTPUT"
+          echo "label=$LABEL"         >> "$GITHUB_OUTPUT"
+          echo "outdir=$OUTDIR"       >> "$GITHUB_OUTPUT"
+          echo "outframes=$OUTFRAMES" >> "$GITHUB_OUTPUT"
+          echo "Resolved DAY=$DAY  LABEL=$LABEL  OUTDIR=$OUTDIR"
 
-          echo "Resolved DAY=$DAY  LOOKBACK=${LOOKBACK_DAYS}d"
-
-      - name: Pool frames from last N days
+      - name: Pool frames from selected days
         shell: bash
         run: |
           set -euo pipefail
           RAWROOT="data/raw"
           OUTFRAMES="${{ steps.resolve.outputs.outframes }}"
-
           mkdir -p "$OUTFRAMES"
 
           mapfile -t ALL_DAYS < <(find "$RAWROOT" -maxdepth 1 -mindepth 1 -type d -name "????-??-??" -printf "%f\n" | sort)
 
           N="${LOOKBACK_DAYS}"
-
           if [[ -n "${START_DAY}" ]]; then
-            # Pin to START_DAY + next N-1 days by generating the date sequence
-            echo "Pinned start: ${START_DAY}, pooling ${N} days forward"
             USE_DAYS=()
             for i in $(seq 0 $(( N - 1 ))); do
-              D=$(date -d "${START_DAY} + ${i} days" +%F 2>/dev/null || python3 -c "
-          from datetime import date, timedelta
-          d = date.fromisoformat('${START_DAY}') + timedelta(days=${i})
-          print(d.isoformat())")
-              # Only include if the folder actually exists
-              if [[ -d "$RAWROOT/$D" ]]; then
-                USE_DAYS+=("$D")
-              else
-                echo "WARNING: $D not found in data/raw — skipping"
-              fi
+              # Pure bash date arithmetic — no python3 needed
+              D=$(date -d "${START_DAY} + ${i} days" +%F)
+              [[ -d "$RAWROOT/$D" ]] && USE_DAYS+=("$D") || echo "WARNING: $D not found — skipping"
             done
           else
-            # Default: last N days chronologically
             TOTAL="${#ALL_DAYS[@]}"
             START=$(( TOTAL - N ))
             [[ $START -lt 0 ]] && START=0
             USE_DAYS=("${ALL_DAYS[@]:$START:$N}")
           fi
 
-          echo "Pooling frames from ${#USE_DAYS[@]} days: ${USE_DAYS[*]}"
-          [[ ${#USE_DAYS[@]} -gt 0 ]] || { echo "ERROR: No valid days found"; exit 1; }
-
+          echo "Pooling from: ${USE_DAYS[*]}"
           COPIED=0
-          DAYS_WITH_FRAMES=0
           for D in "${USE_DAYS[@]}"; do
             DDIR="$RAWROOT/$D"
-
             if   [[ -d "$DDIR/filtered" ]]; then SRC="$DDIR/filtered"
             elif [[ -d "$DDIR/latest"   ]]; then SRC="$DDIR/latest"
             else echo "Skipping $D — no frames folder"; continue
             fi
-
-            DAY_COUNT=0
             shopt -s globstar nullglob
             for f in "$SRC"/**/*.png "$SRC"/*.png; do
-              [[ -f "$f" ]] && { cp -f "$f" "$OUTFRAMES/"; COPIED=$((COPIED+1)); DAY_COUNT=$((DAY_COUNT+1)); }
+              [[ -f "$f" ]] && { cp -f "$f" "$OUTFRAMES/"; COPIED=$((COPIED+1)); }
             done
-            echo "  $D: $DAY_COUNT frames"
-            [[ $DAY_COUNT -gt 0 ]] && DAYS_WITH_FRAMES=$((DAYS_WITH_FRAMES+1))
+            echo "  $D: copied"
           done
 
-          echo "Total frames pooled: $COPIED from $DAYS_WITH_FRAMES days"
-          [[ $COPIED -gt 0 ]] || { echo "ERROR: No frames found in any of the selected days"; exit 1; }
-
-      - name: Phase 2 - Storm tracking
-        shell: bash
-        run: |
-          set -euo pipefail
-          OUTDIR="${{ steps.resolve.outputs.outdir }}"
-          mkdir -p "$OUTDIR/daily"
-
-          python scripts/pipeline/run_sample_pipeline.py \
-            --raw-dir "${{ steps.resolve.outputs.outframes }}" \
-            --outdir  "$OUTDIR/daily" \
-            --save-overlays
+          echo "Total frames pooled: $COPIED"
+          [[ $COPIED -gt 0 ]] || { echo "ERROR: No frames found"; exit 1; }
 
       - name: Phase 3A - Baseline cloud masks
         id: p3baseline
@@ -227,18 +156,15 @@ jobs:
           mkdir -p "$BASELINE_OUTDIR"
 
           python scripts/experiments/segmentation/cloud_mask_baseline_v2.py \
-            --raw-dir  "${{ steps.resolve.outputs.outframes }}" \
-            --outdir   "$BASELINE_OUTDIR" \
+            --raw-dir    "${{ steps.resolve.outputs.outframes }}" \
+            --outdir     "$BASELINE_OUTDIR" \
             --image-size 256 \
             --save-overlays \
             --luma-thresh "${LUMA_THRESH}" \
             --sat-thresh  "${SAT_THRESH}" \
             --min-area    "${MIN_AREA}"
 
-          ls -la "$BASELINE_OUTDIR/cloud_metrics.csv"
-
-          echo "masks_dir=$BASELINE_OUTDIR/masks"         >> "$GITHUB_OUTPUT"
-          echo "metrics_csv=$BASELINE_OUTDIR/cloud_metrics.csv" >> "$GITHUB_OUTPUT"
+          echo "masks_dir=$BASELINE_OUTDIR/masks" >> "$GITHUB_OUTPUT"
 
       - name: Phase 3B - Train U-Net
         id: p3train
@@ -260,12 +186,9 @@ jobs:
             --pos-weight 3.0 \
             --split-by-time
 
-          ls -la out/models/unet_pixelmask_latest.pt
-          ls -la out/viz/unet_training_curves.png || true
-
           echo "model_path=out/models/unet_pixelmask_latest.pt" >> "$GITHUB_OUTPUT"
 
-      - name: Phase 3C - Infer U-Net masks (thr=0.3 only)
+      - name: Phase 3C - Infer U-Net masks (thr=0.3)
         id: p3infer
         shell: bash
         run: |
@@ -275,143 +198,64 @@ jobs:
           mkdir -p "$CANON_OUT"
 
           python ml/infer_unet_pixelmask.py \
-            --frames   "${{ steps.resolve.outputs.outframes }}" \
-            --outdir   "$CANON_OUT" \
-            --ckpt     "${{ steps.p3train.outputs.model_path }}" \
+            --frames    "${{ steps.resolve.outputs.outframes }}" \
+            --outdir    "$CANON_OUT" \
+            --ckpt      "${{ steps.p3train.outputs.model_path }}" \
             --recursive \
             --threshold 0.3 \
             --image-size 256 \
             --device cpu
 
-          ls -la "$CANON_OUT/masks_unet" | head -n 10 || true
           echo "canon_out=$CANON_OUT" >> "$GITHUB_OUTPUT"
 
-      - name: Phase 4A - Build ConvLSTM CSV
-        if: ${{ env.ENABLE_PHASE4 != '0' }}
-        id: p4csv
-        shell: bash
-        run: |
-          set -euo pipefail
-          OUTDIR="${{ steps.resolve.outputs.outdir }}"
-          mkdir -p "$OUTDIR/phase4_convlstm"
-
-          python - <<'PY'
-          from pathlib import Path
-          import re, pandas as pd
-
-          rawdir   = Path("${{ steps.resolve.outputs.outframes }}")
-          canon    = Path("${{ steps.p3infer.outputs.canon_out }}") / "masks_unet"
-          outcsv   = Path("${{ steps.resolve.outputs.outdir }}") / "phase4_convlstm" / "convlstm_metrics.csv"
-
-          def ts(name):
-              m = re.search(r"himawari_(\d{8}T\d{6})Z", name)
-              return m.group(1) + "Z" if m else None
-
-          rows = []
-          for f in sorted(rawdir.glob("*.png")):
-              t = ts(f.name)
-              if not t: continue
-              mask = canon / f"{f.stem}_mask.png"
-              if not mask.exists(): continue
-              rows.append({"timestamp_utc": t,
-                           "image_path": str(f).replace("\\", "/"),
-                           "mask_path":  str(mask).replace("\\", "/")})
-
-          df = pd.DataFrame(rows).sort_values("timestamp_utc").reset_index(drop=True)
-          outcsv.parent.mkdir(parents=True, exist_ok=True)
-          df.to_csv(outcsv, index=False)
-          print(f"Wrote {outcsv}  rows={len(df)}")
-          if len(df) < 4:
-              raise SystemExit("Not enough frame/mask pairs for ConvLSTM.")
-          PY
-
-          echo "metrics_csv=${{ steps.resolve.outputs.outdir }}/phase4_convlstm/convlstm_metrics.csv" >> "$GITHUB_OUTPUT"
-
-      - name: Phase 4B - Train ConvLSTM
-        if: ${{ env.ENABLE_PHASE4 != '0' && steps.p4csv.outputs.metrics_csv != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          METRICS="${{ steps.p4csv.outputs.metrics_csv }}"
-
-          echo "---- training ConvLSTM: ${CONVLSTM_EPOCHS} epochs ----"
-          python -u ml/train_convlstm.py \
-            --metrics-csv "$METRICS" \
-            --outdir out \
-            --seq-len  "${CONVLSTM_SEQ_LEN}" \
-            --rollout-k "${CONVLSTM_ROLLOUT_K}" \
-            --epochs    "${CONVLSTM_EPOCHS}" \
-            --batch-size 2
-
-          ls -la out/models | grep -i convlstm || true
-          ls -la out/viz    | grep -i convlstm || true
-
-      - name: Phase 4C - Evaluate ConvLSTM rollouts
-        if: ${{ env.ENABLE_PHASE4 != '0' && steps.p4csv.outputs.metrics_csv != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          OUTDIR="${{ steps.resolve.outputs.outdir }}"
-          ROLLOUT_DIR="$OUTDIR/phase4_convlstm/rollout_eval"
-          mkdir -p "$ROLLOUT_DIR"
-
-          CKPT="out/models/convlstm_ss_best_gray.pt"
-          test -f "$CKPT" || { echo "ERROR: missing ckpt $CKPT"; exit 1; }
-
-          python -u ml/eval_convlstm_rollout.py \
-            --metrics-csv "${{ steps.p4csv.outputs.metrics_csv }}" \
-            --ckpt        "$CKPT" \
-            --outdir      "$ROLLOUT_DIR" \
-            --seq-len 6 \
-            --rollout-k 2 \
-            --thr 0.30 \
-            --feedback prob \
-            --val-frac 0.20 \
-            --viz-samples 3 \
-            --viz-evenly-spaced \
-            --device cpu
-
-          ls -la "$ROLLOUT_DIR"
-
-      - name: Collect training curves into output folder
+      - name: Collect U-Net training curves
         if: always()
         shell: bash
         run: |
           OUTDIR="${{ steps.resolve.outputs.outdir }}"
+          mkdir -p "$OUTDIR/phase3_unet_pixelmask_thr03"
+          cp out/viz/unet_training_curves.png "$OUTDIR/phase3_unet_pixelmask_thr03/" 2>/dev/null || true
+          cp out/viz/unet_val_previews.png    "$OUTDIR/phase3_unet_pixelmask_thr03/" 2>/dev/null || true
 
-          cp out/viz/unet_training_curves.png                 "$OUTDIR/phase3_unet_pixelmask_thr03/" 2>/dev/null || true
-          cp out/viz/unet_val_previews.png                    "$OUTDIR/phase3_unet_pixelmask_thr03/" 2>/dev/null || true
-          cp out/viz/convlstm_training_curves_ss_gray.png     "$OUTDIR/phase4_convlstm/"             2>/dev/null || true
-          cp out/viz/convlstm_val_previews_ss_gray.png        "$OUTDIR/phase4_convlstm/"             2>/dev/null || true
-          cp out/convlstm_history_ss_gray.csv                 "$OUTDIR/phase4_convlstm/"             2>/dev/null || true
-
-          echo "---- phase3 curves ----"
-          ls -la "$OUTDIR/phase3_unet_pixelmask_thr03/"*.png 2>/dev/null || echo "(none)"
-          echo "---- phase4 curves ----"
-          ls -la "$OUTDIR/phase4_convlstm/"*.png 2>/dev/null || echo "(none)"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: multiday_rollup_${{ steps.resolve.outputs.label }}_${{ env.LOOKBACK_DAYS }}d
-          if-no-files-found: ignore
-          path: |
-            ${{ steps.resolve.outputs.outdir }}
-
-      - name: Commit results to data branch
+      # Write a handoff file so the ConvLSTM workflow knows where everything lives
+      - name: Write handoff metadata
         shell: bash
         run: |
           set -euo pipefail
+          OUTDIR="${{ steps.resolve.outputs.outdir }}"
+          LABEL="${{ steps.resolve.outputs.label }}"
+          DAY="${{ steps.resolve.outputs.day }}"
+          OUTFRAMES="${{ steps.resolve.outputs.outframes }}"
+          CANON_OUT="${{ steps.p3infer.outputs.canon_out }}"
+          MODEL_PATH="${{ steps.p3train.outputs.model_path }}"
+          mkdir -p "$OUTDIR"
+          printf '{\n  "label": "%s",\n  "day": "%s",\n  "outdir": "%s",\n  "outframes": "%s",\n  "canon_out": "%s",\n  "model_path": "%s",\n  "lookback_days": "%s"\n}\n' \
+            "$LABEL" "$DAY" "$OUTDIR" "$OUTFRAMES" "$CANON_OUT" "$MODEL_PATH" "$LOOKBACK_DAYS" \
+            > "$OUTDIR/handoff.json"
+          echo "Wrote $OUTDIR/handoff.json:"
+          cat "$OUTDIR/handoff.json"
 
-          git add -f out || true
+      - name: Upload U-Net artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: multiday_unet_${{ steps.resolve.outputs.label }}_${{ env.LOOKBACK_DAYS }}d
+          if-no-files-found: warn
+          path: |
+            ${{ steps.resolve.outputs.outdir }}/phase3_unet_pixelmask_thr03
+            ${{ steps.resolve.outputs.outdir }}/phase2_baseline/cloud_metrics.csv
+
+      - name: Commit U-Net results to data branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -f out "${{ steps.resolve.outputs.outdir }}" || true
 
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "Nothing to commit."
             exit 0
           fi
 
-          git commit -m "multiday rollup (${LOOKBACK_DAYS}d): ${{ steps.resolve.outputs.day }}"
-
+          git commit -m "multiday-rollup (unet done): ${{ steps.resolve.outputs.label }} ${LOOKBACK_DAYS}d"
           git fetch origin data
           git pull --rebase --autostash origin data
           git push origin data
