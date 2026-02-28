@@ -14,7 +14,7 @@ on:
       unet_epochs:
         description: "U-Net training epochs."
         required: false
-        default: "60"
+        default: "40"
       convlstm_epochs:
         description: "ConvLSTM training epochs."
         required: false
@@ -252,7 +252,7 @@ jobs:
             --outdir out \
             --image-size 256 \
             --epochs "${UNET_EPOCHS}" \
-            --batch-size 4 \
+            --batch-size 8 \
             --lr 3e-4 \
             --base-ch 32 \
             --augment \
@@ -265,12 +265,11 @@ jobs:
 
           echo "model_path=out/models/unet_pixelmask_latest.pt" >> "$GITHUB_OUTPUT"
 
-      - name: Phase 3C - Infer U-Net masks (thr=0.3)
+      - name: Phase 3C - Infer U-Net masks (thr=0.3 only)
         id: p3infer
         shell: bash
         run: |
           set -euo pipefail
-          DAY="${{ steps.resolve.outputs.day }}"
           OUTDIR="${{ steps.resolve.outputs.outdir }}"
           CANON_OUT="$OUTDIR/phase3_unet_pixelmask_thr03"
           mkdir -p "$CANON_OUT"
@@ -335,16 +334,7 @@ jobs:
           set -euo pipefail
           METRICS="${{ steps.p4csv.outputs.metrics_csv }}"
 
-          echo "---- smoke run (1 epoch) ----"
-          python -u ml/train_convlstm.py \
-            --metrics-csv "$METRICS" \
-            --outdir out \
-            --seq-len  "${CONVLSTM_SEQ_LEN}" \
-            --rollout-k 1 \
-            --epochs 1 \
-            --batch-size 2
-
-          echo "---- full run ----"
+          echo "---- training ConvLSTM: ${CONVLSTM_EPOCHS} epochs ----"
           python -u ml/train_convlstm.py \
             --metrics-csv "$METRICS" \
             --outdir out \
