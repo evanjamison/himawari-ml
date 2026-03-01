@@ -1,0 +1,9 @@
+{
+  "label": "2026-02-28",
+  "day": "2026-02-28",
+  "outdir": "out/2026-02-28_multiday3d",
+  "outframes": "out/2026-02-28_multiday3d/frames",
+  "canon_out": "out/2026-02-28_multiday3d/phase3_unet_pixelmask_thr03",
+  "model_path": "out/models/unet_pixelmask_latest.pt",
+  "lookback_days": "3"
+}

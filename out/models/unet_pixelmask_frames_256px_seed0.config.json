@@ -1,11 +1,11 @@
 {
-  "frames_dir": "data/raw/2026-02-28/master/frames",
-  "masks_dir": "out/2026-02-28/phase2_baseline/masks",
+  "frames_dir": "out/2026-02-28_multiday3d/frames",
+  "masks_dir": "out/2026-02-28_multiday3d/phase2_baseline/masks",
   "outdir": "out",
   "image_size": 256,
   "mask_threshold": 128,
-  "epochs": 30,
-  "batch_size": 4,
+  "epochs": 40,
+  "batch_size": 8,
   "lr": 0.0003,
   "base_ch": 32,
   "bce_weight": 0.5,
@@ -18,7 +18,7 @@
   "threshold_eval": 0.5,
   "run_id": "unet_pixelmask_frames_256px_seed0",
   "device_resolved": "cpu",
-  "n_pairs": 40,
-  "n_train": 32,
-  "n_val": 8
+  "n_pairs": 167,
+  "n_train": 134,
+  "n_val": 33
 }
