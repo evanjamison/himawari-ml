@@ -1,0 +1,91 @@
+name: ingest-japan
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes — collects ~3 frames per run at 10-min cadence
+  workflow_dispatch:
+    inputs:
+      lookback_minutes:
+        description: "Minutes to look back for frames"
+        required: false
+        default: "40"
+      target_saved:
+        description: "Target number of frames to save per run"
+        required: false
+        default: "4"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ingest-japan
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+
+    env:
+      TARGET_SAVED:      ${{ github.event.inputs.target_saved      || '4' }}
+      LOOKBACK_MINUTES:  ${{ github.event.inputs.lookback_minutes  || '40' }}
+      FETCH_DELAY:       "1.0"
+      CROP_TIMESTAMP:    "1"
+
+    steps:
+      - name: Checkout main (code)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch data branch
+        run: git fetch origin data
+
+      - name: Switch to data branch and sync code from main
+        run: |
+          set -e
+          git switch data || git switch -c data
+          git merge origin/main --no-edit || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+          pip install requests pillow
+
+      - name: Ingest Japan-area frames (JMA SND, 10-min cadence)
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          DAY="$(date -u +%F)"
+          OUTDIR="data/raw/${DAY}/latest"
+          mkdir -p "$OUTDIR"
+          echo "Ingesting Japan-area frames into $OUTDIR"
+          HIMAWARI_OUT_DIR="$OUTDIR" \
+            python -m himawari_ml.ingest.fetch_japan
+          echo "---- directory contents ----"
+          ls -la "$OUTDIR" | tail -n 20 || true
+          echo "---- total frames today ----"
+          ls "$OUTDIR"/*.png 2>/dev/null | wc -l || echo "0"
+
+      - name: Commit raw frames to data branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          DAY="$(date -u +%F)"
+          git add -f "data/raw/${DAY}" || true
+          if git diff --cached --quiet; then
+            echo "No new frames to commit."
+            exit 0
+          fi
+          FRAME_COUNT=$(git diff --cached --name-only | grep '\.png$' | wc -l || echo 0)
+          git commit -m "ingest(japan): ${DAY} $(date -u +'%H:%MZ') +${FRAME_COUNT} frames"
+          git push origin data
