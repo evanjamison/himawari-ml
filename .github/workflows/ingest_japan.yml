@@ -65,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           DAY="$(date -u +%F)"
-          OUTDIR="data/raw/${DAY}/latest"
+          OUTDIR="data/japan_raw/${DAY}/latest"
           mkdir -p "$OUTDIR"
           echo "Ingesting Japan-area frames into $OUTDIR"
           HIMAWARI_OUT_DIR="$OUTDIR" \
@@ -81,7 +81,7 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
           DAY="$(date -u +%F)"
-          git add -f "data/raw/${DAY}" || true
+          git add -f "data/japan_raw/${DAY}" || true
           if git diff --cached --quiet; then
             echo "No new frames to commit."
             exit 0
