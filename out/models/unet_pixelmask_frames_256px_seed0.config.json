@@ -1,6 +1,6 @@
 {
-  "frames_dir": "data/raw/2026-03-01/master/frames",
-  "masks_dir": "out/2026-03-01/phase2_baseline/masks",
+  "frames_dir": "data/japan_raw/2026-03-02/master/frames",
+  "masks_dir": "out/2026-03-02/phase2_baseline/masks",
   "outdir": "out",
   "image_size": 256,
   "mask_threshold": 128,
@@ -18,7 +18,7 @@
   "threshold_eval": 0.5,
   "run_id": "unet_pixelmask_frames_256px_seed0",
   "device_resolved": "cpu",
-  "n_pairs": 71,
-  "n_train": 57,
-  "n_val": 14
+  "n_pairs": 144,
+  "n_train": 116,
+  "n_val": 28
 }
