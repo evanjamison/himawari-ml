@@ -2,10 +2,11 @@
 fetch_japan.py — Himawari-9 Japan-area ingest via JMA MSC
 ==========================================================
 Source: Japan Meteorological Agency Meteorological Satellite Center
-URL:    https://www.data.jma.go.jp/mscweb/data/himawari/img/jpn/jpn_snd_{HHMM}.jpg
+URL:    https://www.data.jma.go.jp/mscweb/data/himawari/img/jpn/jpn_b13_{HHMM}.jpg
 
 Coverage: 115°E–155°E, 22°N–48°N  (Japan perfectly centered)
-Band:     SND (sandwich IR + color enhancement) — works 24/7, ideal for cloud detection
+Band:     B13 (10.4 µm thermal IR) — illumination-invariant, works 24/7,
+          no terminator line, cold cloud tops = bright, clear sky = dark.
 Cadence:  10-minute, 24-hour rolling archive (144 frames/day)
 
 Preprocessing:
@@ -58,7 +59,7 @@ def snap_10min(dt: datetime) -> datetime:
 
 
 def frame_url(dt: datetime) -> str:
-    return f"{BASE_URL}/jpn_snd_{dt.hour:02d}{dt.minute:02d}.jpg"
+    return f"{BASE_URL}/jpn_b13_{dt.hour:02d}{dt.minute:02d}.jpg"
 
 
 def frame_path(dt: datetime) -> Path:
@@ -114,7 +115,7 @@ def main():
         t -= timedelta(minutes=10)
 
     log.info(
-        f"Japan-area ingest (JMA SND) | outdir={OUT_DIR} | target={TARGET_SAVED} "
+        f"Japan-area ingest (JMA B13) | outdir={OUT_DIR} | target={TARGET_SAVED} "
         f"| lookback={LOOKBACK_MIN} min | slots={len(slots)} "
         f"| crop_timestamp={CROP_TIMESTAMP} "
         f"| latest={latest.strftime('%Y-%m-%dT%H:%MZ')}"
