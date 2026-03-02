@@ -9,6 +9,17 @@ Outputs:
 - out/masks/*.png          (binary cloud masks)
 - out/cloud_metrics.csv    (training manifest)
 - optional overlay images
+
+Changelog:
+- Added --cold-top-detection flag (on by default) to catch blue/teal/cyan
+  color-enhanced cold cloud tops in SND (sandwich) imagery via a hue-based
+  second detection branch. These pixels have high IR saturation and are missed
+  by the standard bright+low-sat branch.
+- Raised default --luma-thresh from 0.60 to 0.55 for better mid-cloud recall
+  on SND imagery without over-detecting dark ocean/land.
+- Added --cold-hue-min / --cold-hue-max / --cold-val-min args for tuning the
+  cold-top hue range (OpenCV HSV hue is 0-179).
+  Defaults (85-135) cover cyan through blue, avoiding green land borders.
 """
 
 from __future__ import annotations
@@ -64,18 +75,40 @@ def cloud_mask_baseline(
     open_size: int,
     close_size: int,
     min_area: int,
+    cold_top_detection: bool,
+    cold_hue_min: int,
+    cold_hue_max: int,
+    cold_val_min: float,
 ) -> np.ndarray:
     """
     Generate cloud mask from RGB image.
+
+    Two detection branches:
+      1. Bright + low-saturation: catches mid/low cloud and thick overcast
+         (the classic heuristic).
+      2. Cold-top hue branch (SND sandwich imagery only): catches the
+         blue/teal/cyan color-enhanced cold cloud tops that have high
+         saturation and are rejected by branch 1.
     """
 
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-    v = hsv[..., 2].astype(np.float32) / 255.0
+    h = hsv[..., 0].astype(np.int32)   # 0-179 in OpenCV
     s = hsv[..., 1].astype(np.float32) / 255.0
+    v = hsv[..., 2].astype(np.float32) / 255.0
 
-    # Bright & low-sat → clouds
-    cloud_raw = (v >= luma_thresh) & (s <= sat_thresh)
-    cloud = cloud_raw.astype(np.uint8)
+    # --- Branch 1: bright & low-sat (mid/low cloud, thick overcast) ---
+    cloud_bright = (v >= luma_thresh) & (s <= sat_thresh)
+
+    # --- Branch 2: cold tops (blue/teal/cyan hue in SND color scale) ---
+    if cold_top_detection:
+        cloud_cold = (
+            (h >= cold_hue_min) & (h <= cold_hue_max) &
+            (v >= cold_val_min)
+        )
+    else:
+        cloud_cold = np.zeros(v.shape, dtype=bool)
+
+    cloud = (cloud_bright | cloud_cold).astype(np.uint8)
 
     # Morphological cleanup
     if open_size > 0:
@@ -112,8 +145,10 @@ def main():
     ap.add_argument("--raw-dir", required=True)
     ap.add_argument("--outdir", default="out")
     ap.add_argument("--image-size", type=int, default=256)
-    ap.add_argument("--luma-thresh", type=float, default=0.60)
-    ap.add_argument("--sat-thresh", type=float, default=0.25)
+    ap.add_argument("--luma-thresh", type=float, default=0.55,
+                    help="Min V (brightness) for bright-cloud branch (default raised to 0.55 for SND)")
+    ap.add_argument("--sat-thresh", type=float, default=0.25,
+                    help="Max S (saturation) for bright-cloud branch")
     ap.add_argument("--open-size", type=int, default=3)
     ap.add_argument("--close-size", type=int, default=7)
     ap.add_argument("--min-area", type=int, default=80)
@@ -122,6 +157,17 @@ def main():
     ap.add_argument("--max-frames", type=int, default=None)
     ap.add_argument("--no-disk-mask", action="store_true",
                     help="Disable circular Earth disk mask (use for regional crops like JMA Japan)")
+
+    # Cold-top detection args
+    ap.add_argument("--no-cold-top-detection", action="store_true",
+                    help="Disable hue-based cold-top branch (enabled by default for SND imagery)")
+    ap.add_argument("--cold-hue-min", type=int, default=85,
+                    help="Min OpenCV hue (0-179) for cold-top branch; 85=cyan (default)")
+    ap.add_argument("--cold-hue-max", type=int, default=135,
+                    help="Max OpenCV hue (0-179) for cold-top branch; 135=blue (default)")
+    ap.add_argument("--cold-val-min", type=float, default=0.15,
+                    help="Min V (brightness) for cold-top branch — excludes pure-black space background")
+
     args = ap.parse_args()
 
     raw_dir = Path(args.raw_dir)
@@ -137,6 +183,8 @@ def main():
     if args.max_frames:
         frames = frames[: args.max_frames]
 
+    cold_top_detection = not args.no_cold_top_detection
+
     records = []
 
     for fp in tqdm(frames, desc="Processing"):
@@ -150,6 +198,10 @@ def main():
             open_size=args.open_size,
             close_size=args.close_size,
             min_area=args.min_area,
+            cold_top_detection=cold_top_detection,
+            cold_hue_min=args.cold_hue_min,
+            cold_hue_max=args.cold_hue_max,
+            cold_val_min=args.cold_val_min,
         )
 
         if not args.no_disk_mask:
