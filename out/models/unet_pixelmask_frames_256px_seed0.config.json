@@ -18,7 +18,7 @@
   "threshold_eval": 0.5,
   "run_id": "unet_pixelmask_frames_256px_seed0",
   "device_resolved": "cpu",
-  "n_pairs": 144,
-  "n_train": 116,
-  "n_val": 28
+  "n_pairs": 164,
+  "n_train": 132,
+  "n_val": 32
 }
