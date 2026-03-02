@@ -34,17 +34,17 @@ on:
         required: false
         default: "20"
       luma_thresh:
-        description: "Baseline luma threshold (brightness). Lower = more clouds detected. B13 default: 0.45"
+        description: "Baseline luma threshold (brightness). Lower = more clouds detected. B13 default: 0.35"
         required: false
-        default: "0.45"
+        default: "0.35"
       min_area:
         description: "Baseline minimum cloud component area in pixels."
         required: false
         default: "60"
       adaptive_c:
-        description: "Adaptive threshold constant. More negative = stricter. B13 default: -8"
+        description: "Adaptive threshold constant. More negative = stricter. B13 default: -6"
         required: false
-        default: "-8"
+        default: "-6"
 
 permissions:
   contents: write
@@ -68,9 +68,9 @@ jobs:
       CONVLSTM_EPOCHS:    ${{ github.event.inputs.convlstm_epochs    || '20' }}
 
       # B13 baseline params — no sat_thresh needed (pure grayscale band)
-      LUMA_THRESH:        ${{ github.event.inputs.luma_thresh        || '0.45' }}
+      LUMA_THRESH:        ${{ github.event.inputs.luma_thresh        || '0.35' }}
       MIN_AREA:           ${{ github.event.inputs.min_area           || '60' }}
-      ADAPTIVE_C:         ${{ github.event.inputs.adaptive_c         || '-8' }}
+      ADAPTIVE_C:         ${{ github.event.inputs.adaptive_c         || '-6' }}
 
     steps:
       - name: Checkout data branch
